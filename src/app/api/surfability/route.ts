@@ -445,7 +445,7 @@ export async function GET(request: NextRequest) {
 
     const weatherData = await weatherRes.json();
 
-    const windSpeed = weatherData.current.wind_speed_10m * 0.539957; // m/s → knots
+    const windSpeed = weatherData.current.wind_speed_10m * 0.539957; // km/h → knots (no wind_speed_unit param set, so Open-Meteo defaults to km/h)
     const windDirection = weatherData.current.wind_direction_10m;
 
     const swellCompass = degreesToCompass(marineData.swellDirection);
