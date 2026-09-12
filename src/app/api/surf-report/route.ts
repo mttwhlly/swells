@@ -176,6 +176,7 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
           bestSpots: location.bestSpots,
           locationName: location.name,
           lat: location.lat,
+          lon: location.lon,
           timezone: location.timezone,
         }),
         signal: AbortSignal.timeout(30000)

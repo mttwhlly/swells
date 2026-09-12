@@ -90,32 +90,52 @@ function getLocalTime(timezone: string, now: Date = new Date()): { hour: number;
   return { hour, formatted, date }
 }
 
-// Approximate sunrise/sunset based on latitude and day of year (±15–20 min accuracy)
-function getDaylightWindow(lat: number, timezone: string, now: Date = new Date()): { rise: number; set: number } {
-  const local = new Date(now.toLocaleString('en-US', { timeZone: timezone }))
-  const startOfYear = new Date(local.getFullYear(), 0, 0)
-  const dayOfYear = Math.floor((local.getTime() - startOfYear.getTime()) / 86400000)
+// Sunrise/sunset via the standard NOAA solar-position approximation (accurate to
+// ~1 minute outside polar latitudes). Solar noon is computed in UTC from the date
+// and longitude (a location west of its timezone's standard meridian sees solar
+// noon *later* in clock time — e.g. Folly Beach, SC is ~20 min west of the Eastern
+// meridian), then sunrise/sunset are offset from it by the day's hour angle. The
+// previous version assumed solar noon == 12:00 local clock time, which ignored both
+// this longitude offset and DST, understating sunrise by up to ~2 hours in summer.
+// Returned as real Date instants (not decimal local hours) so any timezone/DST
+// conversion happens once, at display time, via formatClockTime.
+function getDaylightWindow(lat: number, lon: number, now: Date = new Date()): { rise: Date; set: Date } {
+  const utcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+  const dayOfYear = Math.round((utcMidnight - Date.UTC(now.getUTCFullYear(), 0, 1)) / 86400000)
+  const gamma = 2 * Math.PI / 365 * dayOfYear  // fractional year, radians
 
-  // Solar declination
-  const decl = -23.45 * Math.cos(2 * Math.PI * (dayOfYear + 10) / 365.25)
+  // Equation of time (minutes) — corrects for Earth's elliptical orbit and axial tilt
+  const eqTime = 229.18 * (0.000075 + 0.001868 * Math.cos(gamma) - 0.032077 * Math.sin(gamma)
+    - 0.014615 * Math.cos(2 * gamma) - 0.040849 * Math.sin(2 * gamma))
 
-  // Hour angle at sunrise/sunset (cos = -tan(lat)*tan(decl))
-  const cosHA = -Math.tan(lat * Math.PI / 180) * Math.tan(decl * Math.PI / 180)
+  // Solar declination (radians)
+  const decl = 0.006918 - 0.399912 * Math.cos(gamma) + 0.070257 * Math.sin(gamma)
+    - 0.006758 * Math.cos(2 * gamma) + 0.000907 * Math.sin(2 * gamma)
+    - 0.002697 * Math.cos(3 * gamma) + 0.00148 * Math.sin(3 * gamma)
 
-  if (cosHA > 1) return { rise: 12, set: 12 }  // polar night
-  if (cosHA < -1) return { rise: 0, set: 24 }  // midnight sun
+  const latRad = lat * Math.PI / 180
+  // cos(90.833°) (not cos(90°)) accounts for atmospheric refraction and the sun's
+  // apparent radius — the standard "sunrise" definition (top of disk on the horizon).
+  const cosHA = Math.cos(90.833 * Math.PI / 180) / (Math.cos(latRad) * Math.cos(decl)) - Math.tan(latRad) * Math.tan(decl)
 
-  const ha = (Math.acos(cosHA) * 180 / Math.PI) / 15  // hours from solar noon
-  return { rise: 12 - ha, set: 12 + ha }
+  if (cosHA > 1) return { rise: new Date(utcMidnight), set: new Date(utcMidnight) }  // polar night — never rises today
+  if (cosHA < -1) return { rise: new Date(utcMidnight), set: new Date(utcMidnight + 86400000) }  // midnight sun — never sets today
+
+  const haDeg = Math.acos(cosHA) * 180 / Math.PI  // half-day arc, degrees
+
+  const solarNoonUTC = 720 - 4 * lon - eqTime  // minutes from UTC midnight
+  const riseUTC = solarNoonUTC - 4 * haDeg
+  const setUTC = solarNoonUTC + 4 * haDeg
+
+  return {
+    rise: new Date(utcMidnight + riseUTC * 60000),
+    set: new Date(utcMidnight + setUTC * 60000),
+  }
 }
 
-// Format a decimal hour (e.g. 19.5) as a 12-hour clock string (e.g. "7:30 PM")
-function formatClockTime(hourDecimal: number): string {
-  const h = Math.floor(hourDecimal)
-  const m = Math.round((hourDecimal % 1) * 60)
-  const period = h < 12 ? 'AM' : 'PM'
-  const displayH = h % 12 === 0 ? 12 : h % 12
-  return `${displayH}:${m.toString().padStart(2, '0')} ${period}`
+// Format an instant as a 12-hour clock string in the given timezone (e.g. "7:08 AM")
+function formatClockTime(date: Date, timezone: string): string {
+  return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: timezone })
 }
 
 type SessionViability =
@@ -126,16 +146,17 @@ type SessionViability =
 // Within this many minutes of sunrise, it's "pre-dawn" (sky lightening) rather than "the middle of the night"
 const PRE_DAWN_WINDOW_MINUTES = 90
 
-function getSessionViability(hour: number, lat: number, timezone: string, weatherDescription: string, now: Date = new Date()): SessionViability {
+function getSessionViability(now: Date, lat: number, lon: number, timezone: string, weatherDescription: string): SessionViability {
   if (/thunder|lightning|tropical storm|hurricane/i.test(weatherDescription)) {
     return { viable: false, reason: 'lightning' }
   }
-  const { rise, set } = getDaylightWindow(lat, timezone, now)
-  if (hour < rise || hour >= set) {
-    const riseStr = formatClockTime(rise)
+  const { rise, set } = getDaylightWindow(lat, lon, now)
+  if (now.getTime() < rise.getTime() || now.getTime() >= set.getTime()) {
+    const riseStr = formatClockTime(rise, timezone)
     // Before sunrise, minutesToRise is straightforward. After sunset, the next sunrise
-    // is tomorrow's — approximate it as the same clock time, 24h later.
-    const minutesToRise = Math.round((hour < rise ? rise - hour : rise + 24 - hour) * 60)
+    // is tomorrow's — approximate it as today's sunrise time, 24h later.
+    const nextRise = now.getTime() >= set.getTime() ? new Date(rise.getTime() + 86400000) : rise
+    const minutesToRise = Math.round((nextRise.getTime() - now.getTime()) / 60000)
     return { viable: false, reason: 'night', riseStr, minutesToRise, isPreDawn: minutesToRise <= PRE_DAWN_WINDOW_MINUTES }
   }
   return { viable: true }
@@ -193,6 +214,7 @@ export interface LocationContext {
   voiceDescriptor: string;
   bestSpots: string[];
   lat: number;
+  lon: number;
   timezone: string;
 }
 
@@ -219,8 +241,8 @@ export function createDetailedSurfPrompt(surfData: any, ctx: LocationContext, no
   const swellDirection = getCompassDirection(surfData.details.swell_direction_deg)
   const windDirection = getCompassDirection(surfData.details.wind_direction_deg)
   const windOnshoreOffshore = surfData.details.wind_direction_description ?? null
-  const { hour, formatted: localTime, date: localDate } = getLocalTime(ctx.timezone, now)
-  const viability = getSessionViability(hour, ctx.lat, ctx.timezone, surfData.weather.weather_description, now)
+  const { formatted: localTime, date: localDate } = getLocalTime(ctx.timezone, now)
+  const viability = getSessionViability(now, ctx.lat, ctx.lon, ctx.timezone, surfData.weather.weather_description)
 
   const viabilityNote = viability.viable
     ? 'Surfable now'
@@ -251,9 +273,9 @@ It is currently nighttime. Nobody surfs in the dark.
 - Paragraph 2: keep it short. Tell them to come back tomorrow when conditions can be properly assessed. No guessing, no false optimism.
 - timingAdvice: "Check back tomorrow" — nothing more specific.`
 
-  const daylight = getDaylightWindow(ctx.lat, ctx.timezone, now)
-  const sunriseStr = formatClockTime(daylight.rise)
-  const sunsetStr = formatClockTime(daylight.set)
+  const daylight = getDaylightWindow(ctx.lat, ctx.lon, now)
+  const sunriseStr = formatClockTime(daylight.rise, ctx.timezone)
+  const sunsetStr = formatClockTime(daylight.set, ctx.timezone)
 
   const nextTideStr = (() => {
     const nh = surfData.tides?.next_high
@@ -422,8 +444,7 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
   )
 
   const windMph = Math.round(surfData.details.wind_speed_kts * 1.15078)
-  const { hour } = getLocalTime(ctx.timezone, now)
-  const viability = getSessionViability(hour, ctx.lat, ctx.timezone, surfData.weather.weather_description, now)
+  const viability = getSessionViability(now, ctx.lat, ctx.lon, ctx.timezone, surfData.weather.weather_description)
   const fallbackReport = createEnhancedFallbackReport(surfData, windMph, ctx, viability)
 
   return {
@@ -516,7 +537,7 @@ async function handleRequest(req: Request): Promise<Response> {
   if (method === 'POST' && url.pathname === '/generate-surf-report') {
     try {
       const body = await req.json()
-      const { surfData, apiKey, localKnowledge, voiceDescriptor, bestSpots, locationName, lat, timezone } = body
+      const { surfData, apiKey, localKnowledge, voiceDescriptor, bestSpots, locationName, lat, lon, timezone } = body
 
       if (apiKey !== process.env.API_SECRET) {
         return jsonResponse({ error: 'Unauthorized' }, 401)
@@ -531,6 +552,7 @@ async function handleRequest(req: Request): Promise<Response> {
         voiceDescriptor: voiceDescriptor ?? 'experienced surf forecaster',
         bestSpots: bestSpots ?? [],
         lat: lat ?? 30,
+        lon: lon ?? -81,
         timezone: timezone ?? 'America/New_York',
       }
 
@@ -557,7 +579,7 @@ async function handleRequest(req: Request): Promise<Response> {
       const body = await req.json()
       const {
         cronSecret, vercelUrl,
-        locationSlug, locationName, localKnowledge, voiceDescriptor, bestSpots, lat, timezone
+        locationSlug, locationName, localKnowledge, voiceDescriptor, bestSpots, lat, lon, timezone
       } = body
 
       if (cronSecret !== process.env.CRON_SECRET) {
@@ -571,6 +593,7 @@ async function handleRequest(req: Request): Promise<Response> {
         voiceDescriptor: voiceDescriptor ?? 'experienced surf forecaster',
         bestSpots: bestSpots ?? [],
         lat: lat ?? 30,
+        lon: lon ?? -81,
         timezone: timezone ?? 'America/New_York',
       }
 

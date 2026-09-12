@@ -74,6 +74,7 @@ export async function GET(request: NextRequest) {
             voiceDescriptor: location.voiceDescriptor,
             bestSpots: location.bestSpots,
             lat: location.lat,
+            lon: location.lon,
             timezone: location.timezone,
           }),
           signal: AbortSignal.timeout(45000)
