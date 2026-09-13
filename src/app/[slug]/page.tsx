@@ -3,6 +3,7 @@ import { Metadata } from 'next';
 import { SurfAppClient } from '../components/SurfAppClient';
 import { getCachedReport } from '@/lib/db';
 import { getLocation, LOCATIONS } from '@/lib/locations';
+import { describeWaveSize } from '@/lib/waveSize';
 
 interface Props {
   params: Promise<{ slug: string }>;
@@ -43,19 +44,25 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   } catch {}
 
   if (surfReport) {
-    const waveHeight = surfReport.conditions.wave_height_ft;
+    // Titles, snippets and social cards quote the *face* estimate: a reader scanning a
+    // search result or tab reads "4ft waves" as the size of the wave, which offshore Hs
+    // is not. The Hs value stays in the payload for anyone who wants the measurement.
+    const size = surfReport.conditions.size_descriptor
+      ?? describeWaveSize(surfReport.conditions.wave_height_ft, surfReport.conditions.wave_period_sec).size_descriptor;
+    const waveHeight = surfReport.conditions.face_height_ft
+      ?? describeWaveSize(surfReport.conditions.wave_height_ft, surfReport.conditions.wave_period_sec).face_height_ft;
     const condition = extractConditionFromReport(surfReport.report);
     const windSpeed = Math.round(surfReport.conditions.wind_speed_kts);
     const waterTemp = Math.round(surfReport.conditions.water_temperature_f || 72);
-    const title = `${condition} Surf - ${waveHeight}ft waves | Swells`;
-    const description = `${condition} surf conditions at ${location.name}! ${waveHeight}ft waves, ${windSpeed}kt winds, ${waterTemp}°F water. Real-time surf report updated 4 times daily.`;
+    const title = `${condition} Surf - ${size} | Swells`;
+    const description = `${condition} surf conditions at ${location.name}! ${size} waves (~${waveHeight}ft faces), ${windSpeed}kt winds, ${waterTemp}°F water. Real-time surf report updated 4 times daily.`;
     const ogImageUrl = `/api/og?height=${waveHeight}&condition=${encodeURIComponent(condition)}&wind=${windSpeed}&temp=${waterTemp}`;
 
     return {
       title,
       description,
       openGraph: {
-        title: `${condition} Surf - ${waveHeight}ft waves | ${location.name}`,
+        title: `${condition} Surf - ${size} | ${location.name}`,
         description,
         images: [{ url: ogImageUrl, width: 1200, height: 630, alt: `${condition} surf conditions at ${location.name}` }],
       },

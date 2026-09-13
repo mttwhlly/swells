@@ -78,6 +78,23 @@ Two caveats worth knowing:
 
 Note that `wave_period` from Open-Meteo tracks the buoy's *dominant/peak* period (DPD) within ~1s, not the average period — so it is already the quantity surf forecasts quote, and needs no correction.
 
+#### Hs vs. face height (`src/app/lib/waveSize.ts`)
+
+Every upstream source reports **significant wave height (Hs)** — mean trough-to-crest of the highest third of waves, measured offshore. Surfers mean **face height**: the individual breaking wave at the beach. Face is reliably larger (waves shoal before breaking; surfers describe sets, not the mean including lulls), typically ~1.3–1.6× Hs depending on period.
+
+`waveSize.ts` derives `face_height_ft` and a body-scale `size_descriptor` ("chest to shoulder high") from Hs and period. **Unlike the calibration factors, this conversion is a heuristic and cannot be validated** — no instrument measures face height. That's why `size_descriptor` is the field intended for anything user-facing: a band is honest about the precision available, a bare "5.2 ft" is not.
+
+Field conventions, which matter because several consumers read these:
+
+- `wave_height_ft` **is still Hs** everywhere it appears (surfability payload, `surf_reports.conditions`, push `criteria` thresholds). It was not repurposed — changing its meaning would silently shift every stored row and every subscriber's saved threshold.
+- `face_height_ft` / `size_descriptor` are derived, optional additions. Consumers use `waveSizeFor()` in `surf-report/route.ts`, which recomputes from Hs when they're absent so older payloads don't fall back to quoting Hs as a face.
+- User-facing surfaces (page/tab titles, meta description, OG card, push body, report prose) use body scale. Numeric Hs stays in the API payload.
+- Push *matching* (`matchesCriteria`) still compares against Hs, because those thresholds are numbers subscribers set themselves.
+
+**The Bun service prompt is the one piece not in this repo.** `surf-report/route.ts` sends it a `sizeGuidance` object (Hs plus a note that it is not a face height, the face estimate, the descriptor, and preferred phrasing), but whether the generated prose honors it depends on the Bun service's prompt, which must be updated there. Until it is, live AI reports may still quote Hs in feet; the local fallback template already uses body scale.
+
+Two user-facing explanations of all this: a footnote in the "Data sources" dock popover (`SurfAppClient.tsx`) and a section on `/about`.
+
 ### Frontend
 
 `page.tsx` (server component) → `SurfAppClient.tsx` (client component) → `useSurfReportOptimized` hook (TanStack Query) → `/api/surf-report`

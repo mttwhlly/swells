@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getLocation, DEFAULT_LOCATION_SLUG } from '@/lib/locations';
+import { describeWaveSize } from '@/lib/waveSize';
 
 export const dynamic = 'force-dynamic';
 
@@ -455,6 +456,11 @@ export async function GET(request: NextRequest) {
     const windSpeed = weatherData.current.wind_speed_10m * 0.539957; // km/h → knots (no wind_speed_unit param set, so Open-Meteo defaults to km/h)
     const windDirection = weatherData.current.wind_direction_10m;
 
+    const waveSize = describeWaveSize(
+      Math.round(marineData.waveHeight * 10) / 10,
+      marineData.wavePeriod
+    );
+
     const swellCompass = degreesToCompass(marineData.swellDirection);
     const windCompass = degreesToCompass(windDirection);
     const windDescription = getWindDescription(windDirection, windSpeed, location.coastFacingDeg);
@@ -494,7 +500,14 @@ export async function GET(request: NextRequest) {
       goodSurfDuration: "Based on real-time conditions",
       dataQuality: 'real-time-verified',
       details: {
-        wave_height_ft: Math.round(marineData.waveHeight * 10) / 10,
+        // wave_height_ft is significant wave height (Hs) — the measured quantity every
+        // upstream source reports. face_height_ft/size_descriptor are *derived estimates*
+        // of what breaks at the beach; see lib/waveSize.ts. Consumers writing for humans
+        // should prefer size_descriptor.
+        wave_height_ft: waveSize.significant_height_ft,
+        wave_height_basis: 'significant wave height (Hs), offshore',
+        face_height_ft: waveSize.face_height_ft,
+        size_descriptor: waveSize.size_descriptor,
         wave_period_sec: Math.round(marineData.wavePeriod * 10) / 10,
         swell_direction_deg: Math.round(marineData.swellDirection),
         swell_direction_compass: swellCompass,

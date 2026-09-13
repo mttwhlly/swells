@@ -10,6 +10,7 @@ import { ErrorCard } from './ui/ErrorCard';
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { SurfReport } from '../types/surf-report';
 import { getLocation, LOCATIONS } from '../lib/locations';
+import { describeWaveSize } from '@/lib/waveSize';
 
 const STORAGE_KEY = 'surf_location';
 
@@ -129,7 +130,10 @@ export function SurfAppClient({ initialReport, locationSlug }: Props) {
   useEffect(() => {
     if (surfReport && !reportLoading) {
       const condition = extractConditionFromReport(surfReport.report);
-      document.title = `${condition} Surf - ${surfReport.conditions.wave_height_ft}ft waves | Swells`;
+      // Body scale rather than feet — see [slug]/page.tsx for why.
+      const size = surfReport.conditions.size_descriptor
+        ?? describeWaveSize(surfReport.conditions.wave_height_ft, surfReport.conditions.wave_period_sec).size_descriptor;
+      document.title = `${condition} Surf - ${size} | Swells`;
     } else if (!reportLoading) {
       document.title = `Swells - ${locationName}`;
     }
@@ -378,6 +382,22 @@ export function SurfAppClient({ initialReport, locationSlug }: Props) {
                         <span className="text-xs font-mono text-gray-400 dark:text-neutral-400">{detail}</span>
                       </a>
                     ))}
+                    <div className="px-4 py-3 bg-gray-50 dark:bg-neutral-900/50 border-t border-gray-100 dark:border-neutral-700">
+                      <span className="block text-xs font-mono font-semibold uppercase tracking-widest text-gray-400 dark:text-neutral-400 mb-1.5">
+                        How size is measured
+                      </span>
+                      <p className="text-xs font-mono text-gray-500 dark:text-neutral-400 leading-relaxed">
+                        Forecasts report significant wave height offshore, which is smaller than the
+                        wave face you actually ride. Sizes here are described in body scale, adjusted
+                        against the nearest NOAA buoy.{' '}
+                        <Link
+                          href="/about"
+                          className="underline underline-offset-2 decoration-dashed hover:text-gray-700 dark:hover:text-neutral-200 transition-colors"
+                        >
+                          more
+                        </Link>
+                      </p>
+                    </div>
                   </motion.div>
                 )}
               </AnimatePresence>

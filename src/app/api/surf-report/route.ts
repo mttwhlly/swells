@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getCachedReport, saveReport, ensureInitialized } from '@/lib/db';
 import { getLocation, DEFAULT_LOCATION_SLUG, type Location } from '@/lib/locations';
 import type { SurfReport } from '@/types/surf-report';
+import { describeWaveSize } from '@/lib/waveSize';
 
 export const dynamic = 'force-dynamic';
 
@@ -10,7 +11,13 @@ interface SurfabilityData {
   location: string;
   score: number;
   details: {
+    /** Significant wave height (Hs) offshore — measured, not the wave face. */
     wave_height_ft: number;
+    wave_height_basis?: string;
+    /** Estimated breaking face height. Derived — see lib/waveSize.ts. */
+    face_height_ft?: number;
+    /** Body-scale size band. Preferred for user-facing prose. */
+    size_descriptor?: string;
     wave_period_sec: number;
     swell_direction_deg: number;
     swell_direction_compass: string;
@@ -122,6 +129,8 @@ function enhanceReportWithCompassDirections(report: SurfReport, surfData: Surfab
     wind_direction_compass: surfData.details.wind_direction_compass,
     wind_direction_text: surfData.details.wind_direction_text,
     wind_direction_description: surfData.details.wind_direction_description,
+    face_height_ft: waveSizeFor(surfData).face_height_ft,
+    size_descriptor: waveSizeFor(surfData).size_descriptor,
     tide_height_ft: surfData.details.tide_height_ft,
     water_temperature_c: surfData.weather.water_temperature_c,
     water_temperature_f: surfData.weather.water_temperature_f,
@@ -171,6 +180,17 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
         body: JSON.stringify({
           surfData,
           apiKey: process.env.BUN_API_SECRET,
+          // The Bun prompt must not read wave_height_ft as a face height. Pass the
+          // translation explicitly so it can describe size the way surfers do.
+          sizeGuidance: {
+            significant_height_ft: surfData.details.wave_height_ft,
+            significant_height_note:
+              'Offshore significant wave height (Hs). This is NOT the height of the wave face — do not quote it to the reader as the size of the surf.',
+            face_height_ft: waveSizeFor(surfData).face_height_ft,
+            size_descriptor: waveSizeFor(surfData).size_descriptor,
+            preferred_phrasing:
+              'Describe the size using size_descriptor (body scale, e.g. "chest to shoulder high"). Avoid quoting a height in feet.',
+          },
           localKnowledge: location.localKnowledge,
           voiceDescriptor: location.voiceDescriptor,
           bestSpots: location.bestSpots,
@@ -207,6 +227,8 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
         report: fallbackReport,
         conditions: {
           wave_height_ft: surfData.details.wave_height_ft,
+          face_height_ft: waveSizeFor(surfData).face_height_ft,
+          size_descriptor: waveSizeFor(surfData).size_descriptor,
           wave_period_sec: surfData.details.wave_period_sec,
           wind_speed_kts: surfData.details.wind_speed_kts,
           wind_direction_deg: surfData.details.wind_direction_deg,
@@ -215,7 +237,7 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
           surfability_score: surfData.score
         },
         recommendations: {
-          board_type: surfData.details.wave_height_ft >= 3 ? 'Shortboard' : 'Longboard',
+          board_type: waveSizeFor(surfData).face_height_ft >= 4 ? 'Shortboard' : 'Longboard',
           wetsuit_thickness: surfData.weather.water_temperature_f < 65 ? '3/2mm' : surfData.weather.water_temperature_f < 72 ? 'Spring suit' : undefined,
           skill_level: surfData.score >= 65 ? 'intermediate' : 'beginner',
           best_spots: location.bestSpots,
@@ -262,18 +284,32 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
   }
 }
 
+/**
+ * Size fields for a surfability payload. /api/surfability supplies these directly, but
+ * the payload arrives over HTTP and older shapes may predate them, so recompute from Hs
+ * when they are absent rather than falling back to reporting Hs as though it were a face.
+ */
+function waveSizeFor(surfData: SurfabilityData) {
+  const { face_height_ft, size_descriptor, wave_height_ft, wave_period_sec } = surfData.details;
+  if (face_height_ft !== undefined && size_descriptor !== undefined) {
+    return { face_height_ft, size_descriptor };
+  }
+  return describeWaveSize(wave_height_ft, wave_period_sec);
+}
+
 function createDetailedFallbackReport(surfData: SurfabilityData, windMph: number, location: Location): string {
   const condition = surfData.score >= 70 ? 'good' : surfData.score >= 50 ? 'fair' : 'poor';
-  const waveDesc = surfData.details.wave_height_ft >= 4 ? 'solid'
-    : surfData.details.wave_height_ft >= 2 ? 'fun-sized' : 'small';
+  // Speak in body scale, not in feet: the underlying number is offshore significant wave
+  // height, which reads as face height to a surfer and is meaningfully smaller than one.
+  const size = waveSizeFor(surfData);
   const swellCompass = surfData.details.swell_direction_compass || 'unknown direction';
   const windCompass = surfData.details.wind_direction_compass || 'variable';
   const primarySpot = location.bestSpots[0] || location.name;
   const secondarySpot = location.bestSpots[1] || location.name;
 
-  const paragraph1 = `${location.name} surf check shows ${waveDesc} ${surfData.details.wave_height_ft}ft waves at ${surfData.details.wave_period_sec} seconds from ${swellCompass} direction, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some long rides' : 'quicker, choppier waves with less push'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} and water temp is ${surfData.weather.water_temperature_f}°F.`;
+  const paragraph1 = `${location.name} surf check shows ${size.size_descriptor} waves at ${surfData.details.wave_period_sec} seconds from ${swellCompass} direction, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some long rides' : 'quicker, choppier waves with less push'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} and water temp is ${surfData.weather.water_temperature_f}°F.`;
 
-  const paragraph2 = `${surfData.details.wave_height_ft >= 3 ? `Grab your shortboard and head to ${primarySpot} where the waves should have some punch` : `${primarySpot} or ${secondarySpot} should find a way to produce rideable waves on a day like this`}. ${surfData.weather.water_temperature_f < 65 ? 'You\'ll want a 3/2mm or thicker wetsuit for that cold water' : surfData.weather.water_temperature_f < 72 ? 'A spring suit should be fine' : 'Boardshorts or spring suit territory — comfortable water temps'}. ${condition === 'good' ? 'Definitely worth the paddle out today!' : condition === 'fair' ? 'Surfable if you need your wave fix.' : 'Might be better for a beach walk, but conditions can change quickly.'}`;
+  const paragraph2 = `${size.face_height_ft >= 4 ? `Grab your shortboard and head to ${primarySpot} where the waves should have some punch` : `${primarySpot} or ${secondarySpot} should find a way to produce rideable waves on a day like this`}. ${surfData.weather.water_temperature_f < 65 ? 'You\'ll want a 3/2mm or thicker wetsuit for that cold water' : surfData.weather.water_temperature_f < 72 ? 'A spring suit should be fine' : 'Boardshorts or spring suit territory — comfortable water temps'}. ${condition === 'good' ? 'Definitely worth the paddle out today!' : condition === 'fair' ? 'Surfable if you need your wave fix.' : 'Might be better for a beach walk, but conditions can change quickly.'}`;
 
   return `${paragraph1}\n\n${paragraph2}`;
 }

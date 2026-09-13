@@ -32,6 +32,35 @@ export default function AboutPage() {
         check conditions yourself before paddling out.
       </p>
 
+      <h2 className="mt-8 text-lg font-bold">How wave size is measured</h2>
+
+      <p className="mt-4 leading-relaxed">
+        Wave forecasts and ocean buoys report <strong>significant wave height</strong> — the
+        average height of the biggest third of waves, measured in open water, well offshore.
+        Surfers mean something different by &ldquo;size&rdquo;: the face of the individual wave
+        they ride, at the beach, as it breaks. The face is reliably the bigger of the two. Waves
+        grow as they move into shallow water before they break, and the waves worth describing
+        are the sets, not the average of everything including the lulls.
+      </p>
+
+      <p className="mt-4 leading-relaxed">
+        That gap is why a forecast can say three feet on a day that looks chest-high in the
+        water. So reports here describe size the way surfers actually talk — waist high, head
+        high, overhead — rather than quoting a number that invites the wrong comparison. The
+        underlying significant wave height is still what gets measured; the body-scale
+        description is an estimate derived from it and the swell period, and it is approximate
+        by design.
+      </p>
+
+      <p className="mt-4 leading-relaxed">
+        The forecast model is also corrected per spot. Global wave models resolve open ocean
+        rather than the sandbars and shoaling each of these beaches sits behind, so they run
+        consistently small at some spots and large at others — around 40% low at St. Augustine
+        and 25% high on Oahu&apos;s North Shore, when checked against the nearest NOAA buoy over
+        a month of readings. Each spot carries its own correction factor fitted against that
+        buoy. These are refitted periodically, since they drift with the seasons.
+      </p>
+
       <h2 className="mt-8 text-lg font-bold">Spots covered</h2>
       <ul className="mt-3 space-y-1">
         {LOCATIONS.map(loc => (

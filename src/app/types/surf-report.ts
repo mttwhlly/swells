@@ -4,7 +4,12 @@ export interface SurfReport {
   location: string;
   report: string;
   conditions: {
+    /** Significant wave height (Hs) offshore — the measured quantity, not the wave face. */
     wave_height_ft: number;
+    /** Estimated breaking face height. Derived, not measured — see lib/waveSize.ts. */
+    face_height_ft?: number;
+    /** Body-scale size band ("chest to shoulder high"). Preferred for anything user-facing. */
+    size_descriptor?: string;
     wave_period_sec: number;
     wind_speed_kts: number;
     wind_direction_deg: number;

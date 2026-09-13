@@ -5,6 +5,7 @@ import {
   setSubscriptionMatchState,
   deletePushSubscription,
 } from './db';
+import { describeWaveSize } from './waveSize';
 
 // Whatever a subscriber opts into is matched against this shape — the same field names
 // already written to surf_reports.conditions by both the Bun service and the local
@@ -70,9 +71,16 @@ export async function notifySubscribersForLocation(
   }
   if (subscriptions.length === 0) return;
 
+  // Body scale, not feet — wave_height_ft is offshore Hs and reads as a face height to a
+  // surfer glancing at a notification. Subscriber *thresholds* still use Hs (see
+  // matchesCriteria) because those are numbers the subscriber set themselves.
+  const size =
+    conditions.size_descriptor ??
+    describeWaveSize(conditions.wave_height_ft, conditions.wave_period_sec).size_descriptor;
+
   const payload = JSON.stringify({
     title: `${locationName} is looking good 🌊`,
-    body: `${conditions.wave_height_ft}ft @ ${conditions.wave_period_sec}s, ${conditions.tide_state.toLowerCase()} tide`,
+    body: `${size} @ ${conditions.wave_period_sec}s, ${conditions.tide_state.toLowerCase()} tide`,
     url: `/${location}`,
   });
 
