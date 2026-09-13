@@ -1,58 +1,87 @@
+%% Swells — system architecture
+%% Keep in step with CLAUDE.md and bun-service/CLAUDE.md.
+
 flowchart TD
-    %% User and UI Layer
-    User["Surfer<br/>Views surf conditions"]
-    UI["React UI (page.tsx)<br/>Displays AI surf report<br/>React Query - 5min updates"]
-    
-    %% Next.js API Layer
-    SurfAPI["Surfability API<br/>/api/surfability<br/>Real-time conditions<br/>1.0ft, 6.7s, 95°"]
-    ReportAPI["AI Surf Report API<br/>/api/surf-report<br/>GPT-4 generated reports<br/>Natural language output"]
-    
-    %% External APIs
-    NOAA_Marine["NOAA Marine API<br/>Wave height: 1.0ft<br/>Wave period: 6.7s<br/>Swell direction: 95°"]
-    NOAA_Tides["NOAA Tides API<br/>Current height: 2.6ft<br/>High/Low times<br/>Tide state: Low Falling"]
-    OpenMeteo["Open-Meteo API<br/>Weather data<br/>Wind: 6.3kts from west<br/>Temperature: 87°F"]
-    OpenAI["OpenAI GPT-4o-mini<br/>Report generation<br/>Natural language<br/>No emojis, compass dirs"]
-    
-    %% Database
-    NeonDB["Neon Database<br/>PostgreSQL<br/>Cached AI reports<br/>15-minute cache"]
-    
-    %% Fallback Systems
-    Fallbacks["Intelligent Fallbacks<br/>• Seasonal estimates<br/>• Wind-based calculations<br/>• Multiple API retries<br/>• Prevents 1.5ft/6s defaults"]
-    
-    %% Components Not In Use (Grayed out)
-    NotInUse["⚠️ Built But Not In Use<br/>• Surf Details Cards (animations)<br/>• Weather Header & Status Card<br/>• Tide Chart Visualization<br/>• Loading animations & Toast<br/>• Service Worker & PWA<br/>• Admin endpoints & Cron jobs"]
-    
-    %% Data Flow Connections
+    %% ---------- Clients ----------
+    User["Surfer<br/>7 locations, one slug route each"]
+    UI["SurfAppClient.tsx<br/>Renders AI prose only — no numeric stat row<br/>TanStack Query: staleTime 30m, no polling<br/>refetch on window focus"]
+    SW["public/sw.js<br/>Offline cache + push/notificationclick<br/>PWA install prompt"]
+
+    %% ---------- Next.js on Vercel ----------
+    subgraph Vercel["Next.js app (Vercel)"]
+        ReportAPI["/api/surf-report<br/>Cache-first: serve DB row if &lt; 8h old"]
+        SurfAPI["/api/surfability<br/>Live conditions + surfability score<br/>STRICT: 503 if any source fails"]
+        AdminAPI["/api/admin/request-forecast<br/>Clears cache, asks Bun to pre-generate"]
+        SaveAPI["/api/admin/save-report<br/>Receives generated reports"]
+        PushLib["lib/push.ts<br/>Evaluates subscriber thresholds, sends web-push"]
+        WaveSize["lib/waveSize.ts<br/>Hs → face height → body-scale descriptor"]
+        Locations["lib/locations.ts<br/>coastFacingDeg, noaaStationId,<br/>waveHeightCalibration per spot"]
+    end
+
+    %% ---------- Bun service ----------
+    subgraph BunSvc["bun-service/ — source in this repo, deployed separately on Coolify"]
+        BunGen["POST /generate-surf-report<br/>Prompt gets body-scale 'Surf Size', never feet"]
+        Ladder{"Model ladder"}
+        Haiku["Claude Haiku<br/>primary"]
+        GPT["GPT-4o-mini<br/>secondary"]
+        BunTmpl["Deterministic template<br/>bun-fallback"]
+        Validate["validateReportText()<br/>banned openers · word count ·<br/>wind ground-truth contradiction"]
+    end
+
+    %% ---------- External ----------
+    subgraph Sources["External data sources"]
+        OMMarine["Open-Meteo Marine<br/>wave height (Hs), period,<br/>swell direction, sea temp"]
+        OMWeather["Open-Meteo Weather<br/>wind, air temp, weather code"]
+        NOAATides["NOAA Tides &amp; Currents<br/>per-location station"]
+        NDBC["NDBC buoys<br/>offline only — source of the<br/>calibration factors,<br/>never called at runtime"]
+    end
+
+    NeonDB[("Neon PostgreSQL<br/>surf_reports · location_requests<br/>push_subscriptions")]
+    Cron["GitHub Actions cron<br/>4x daily, all locations"]
+
+    %% ---------- Flow ----------
     User --> UI
+    UI --> SW
     UI --> ReportAPI
-    ReportAPI --> SurfAPI
-    ReportAPI --> OpenAI
-    ReportAPI --> NeonDB
-    
-    SurfAPI --> NOAA_Marine
-    SurfAPI --> NOAA_Tides  
-    SurfAPI --> OpenMeteo
-    SurfAPI --> Fallbacks
-    
-    %% Styling
+    ReportAPI -->|"cache hit &lt; 8h"| NeonDB
+    ReportAPI -->|"cache miss"| SurfAPI
+    ReportAPI -->|"cache miss"| BunGen
+    ReportAPI -.->|"Bun unreachable →<br/>Next.js local template"| NeonDB
+
+    SurfAPI --> OMMarine
+    SurfAPI --> OMWeather
+    SurfAPI --> NOAATides
+    SurfAPI --> Locations
+    SurfAPI --> WaveSize
+    NDBC -.->|"fitted offline"| Locations
+
+    BunGen --> Ladder
+    Ladder --> Haiku
+    Haiku --> Validate
+    Validate -->|"rejected"| GPT
+    GPT --> Validate
+    Validate -->|"both tiers failed"| BunTmpl
+    BunGen --> SaveAPI
+    SaveAPI --> NeonDB
+
+    Cron --> AdminAPI
+    AdminAPI --> BunGen
+    SaveAPI --> PushLib
+    PushLib --> SW
+
+    %% ---------- Styling ----------
     classDef userStyle fill:#34495e,stroke:#2c3e50,stroke-width:2px,color:#fff
     classDef uiStyle fill:#e74c3c,stroke:#c0392b,stroke-width:2px,color:#fff
     classDef apiStyle fill:#2ecc71,stroke:#27ae60,stroke-width:2px,color:#fff
+    classDef bunStyle fill:#16a085,stroke:#0e6655,stroke-width:2px,color:#fff
     classDef externalStyle fill:#3498db,stroke:#2980b9,stroke-width:2px,color:#fff
     classDef databaseStyle fill:#9b59b6,stroke:#8e44ad,stroke-width:2px,color:#fff
-    classDef fallbackStyle fill:#f39c12,stroke:#e67e22,stroke-width:2px,color:#fff
-    classDef unusedStyle fill:#95a5a6,stroke:#7f8c8d,stroke-width:1px,color:#fff,opacity:0.6
-    
+    classDef cronStyle fill:#f39c12,stroke:#e67e22,stroke-width:2px,color:#fff
+
     class User userStyle
-    class UI uiStyle
-    class SurfAPI,ReportAPI apiStyle
-    class NOAA_Marine,NOAA_Tides,OpenMeteo,OpenAI externalStyle
+    class UI,SW uiStyle
+    class ReportAPI,SurfAPI,AdminAPI,SaveAPI,PushLib,WaveSize,Locations apiStyle
+    class BunGen,Ladder,Haiku,GPT,BunTmpl,Validate bunStyle
+    class OMMarine,OMWeather,NOAATides,NDBC externalStyle
     class NeonDB databaseStyle
-    class Fallbacks fallbackStyle
-    class NotInUse unusedStyle
-    
-    %% Data Flow Annotations
-    UI -.->|"Every 5 minutes"| ReportAPI
-    SurfAPI -.->|"1.0ft, 6.7s, southeast"| NOAA_Marine
-    ReportAPI -.->|"Cache for 15min"| NeonDB
-    Fallbacks -.->|"When APIs fail"| SurfAPI
+    class Cron cronStyle

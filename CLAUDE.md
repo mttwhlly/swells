@@ -16,11 +16,20 @@ pnpm test:watch   # Vitest in watch mode
 pnpm test:e2e     # Playwright: e2e smoke tests (spins up pnpm dev)
 ```
 
+The Bun service has its own commands, run from `bun-service/`:
+
+```bash
+bun test          # Unit tests — offline, no model calls
+bun run eval      # Eval harness — calls the REAL model, costs money, CI gate on index.ts
+bun dev           # Hot-reload dev server
+```
+
 ### Testing
 
 Baseline suite covering the golden paths: home page, a `[slug]` location page, `/api/surf-report` (cache-hit and cache-miss), `/api/og`.
 
-- **Vitest** (`tests/unit/`) tests route-handler logic in isolation — `@/lib/db` and `fetch` are mocked, so no real DB/network calls happen.
+- **Vitest** (`tests/unit/`) tests route-handler logic in isolation — `@/lib/db` and `fetch` are mocked, so no real DB/network calls happen. Also covers the coast-orientation scoring and the Hs→body-scale conversion.
+- **`bun test`** (from `bun-service/`) covers `waveSizeOf`. Offline — it calls no models, unlike `bun run eval`.
 - **Playwright** (`tests/e2e/`) drives a real `pnpm dev` server in a browser. The `/api/surf-report` client fetch is intercepted with `page.route` to avoid exercising the live generation chain (surfability → Bun AI service → DB write); server-side reads of the DB cache (in `[slug]/page.tsx`) are real, so `.env.local` must be present locally. Not wired into CI yet.
 - `/api/og`'s e2e test is `test.fixme()` — the route currently crashes on every request in dev (tracked in [#36](https://github.com/mttwhlly/swells/issues/36)), pre-existing and unrelated to any of this repo's other in-flight work.
 
@@ -41,7 +50,7 @@ Run that in the page context (e.g. `javascript_tool`/`browser_evaluate`), then r
 
 ## Architecture
 
-This is a Next.js 14 app (App Router) that delivers AI-generated surf reports for St. Augustine, FL. The live site is `swells.surf` (previously `surf-report-rouge.vercel.app` and `canisurf.today`, now inactive).
+This is a Next.js 14 app (App Router) that delivers AI-generated surf reports for seven US surf spots (see `src/app/lib/locations.ts`); St. Augustine, FL is the default. Each location has its own slug route, coast orientation, NOAA tide station, local knowledge, and cached report row. The live site is `swells.surf` (previously `surf-report-rouge.vercel.app` and `canisurf.today`, now inactive).
 
 ### Data Flow
 
@@ -55,13 +64,15 @@ Browser → /api/surf-report (GET)
 
 ### Key architectural decision: Bun AI service
 
-Report generation is **not done inside Next.js**. The `BUN_SERVICE_URL` env var points to a separately deployed Bun runtime (hosted on Coolify) that calls OpenAI and saves the report to the DB. The Next.js `surf-report` route only calls the Bun service; if the Bun service is unavailable, it falls back to a local text-template (`createDetailedFallbackReport`).
+Report generation is **not done inside Next.js** — but its source *is* in this repo, at [`bun-service/`](bun-service/CLAUDE.md). Only the *deployment* is separate: it ships as its own Docker image on Coolify (base directory `/bun-service`), and `BUN_SERVICE_URL` points the Next.js app at it over HTTP. Edit the prompt, the model ladder, or the generation fallbacks in `bun-service/index.ts`, not in `src/`.
+
+The service runs a model ladder — Claude Haiku (`@ai-sdk/anthropic`) primary, GPT-4o-mini (`@ai-sdk/openai`) secondary if the primary errors or fails `validateReportText`, then a deterministic non-AI template. The Next.js `surf-report` route only calls the service; if it's unreachable entirely, Next.js falls back to its own local text template (`createDetailedFallbackReport`). Note there are therefore **two** deterministic templates — one in each process — and they need to stay in step.
 
 ### External data sources (all in `/api/surfability/route.ts`)
 
 - **Open-Meteo Marine API** — wave height (m→ft), wave period, swell direction, sea surface temperature
 - **Open-Meteo Weather API** — air temp, wind speed (m/s→knots), wind direction, weather code
-- **NOAA Tides API (station 8720587)** — current tide height, hi/lo predictions
+- **NOAA Tides API** — current tide height, hi/lo predictions. Station is per-location (`noaaStationId` in `locations.ts`), not a single hardcoded station.
 
 `/api/surfability` will 503 if any real data source fails; it has no fallback estimates (strict by design).
 
@@ -91,7 +102,9 @@ Field conventions, which matter because several consumers read these:
 - User-facing surfaces (page/tab titles, meta description, OG card, push body, report prose) use body scale. Numeric Hs stays in the API payload.
 - Push *matching* (`matchesCriteria`) still compares against Hs, because those thresholds are numbers subscribers set themselves.
 
-**The Bun service prompt is the one piece not in this repo.** `surf-report/route.ts` sends it a `sizeGuidance` object (Hs plus a note that it is not a face height, the face estimate, the descriptor, and preferred phrasing), but whether the generated prose honors it depends on the Bun service's prompt, which must be updated there. Until it is, live AI reports may still quote Hs in feet; the local fallback template already uses body scale.
+**The generation prompt is in `bun-service/index.ts`** — that service deploys separately but its source lives in this repo. Its prompt receives `Surf Size: <body scale label>` rather than a height in feet, plus an explicit instruction not to quote feet. `surf-report/route.ts` also sends a `sizeGuidance` object alongside the payload. Both the AI prose and the deterministic fallback templates now describe size in body scale; verified against the live model with `bun run eval`.
+
+Because the Bun service deploys as its own image and cannot import from `src/`, it carries a mirror of this conversion (`waveSizeOf` in `bun-service/index.ts`). The two are held in step by an identical golden table in `tests/unit/wave-size.test.ts` and `bun-service/waveSize.test.ts` — if they drift, one suite fails. Change both implementations, then both tables.
 
 Two user-facing explanations of all this: a footnote in the "Data sources" dock popover (`SurfAppClient.tsx`) and a section on `/about`.
 

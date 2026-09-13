@@ -9,9 +9,11 @@ Report generation is a two-model pipeline — Claude Haiku, with GPT-4o-mini as 
 - **AI-generated reports** — 2-paragraph natural-language surf reports per location, refreshed 4×/day
 - **7 locations** — St. Augustine FL, Boca Raton FL, Higgins Beach ME, Folly Beach SC, Rockaway Beach NY, Huntington Beach CA, Oahu HI (`src/app/lib/locations.ts`)
 - **Real, unfaked data** — wave height/period/swell direction (Open-Meteo Marine), wind (Open-Meteo Weather), tides (NOAA). If a source fails, the conditions API returns `503` rather than estimating.
+- **Buoy-calibrated wave height** — global wave models resolve open ocean, not the sandbars each beach sits behind, so they run consistently small at some spots and large at others (~43% low at St. Augustine, ~25% high on Oahu). Each spot carries a correction factor fitted against its nearest NDBC buoy and validated out-of-sample.
+- **Size in body scale, not feet** — forecasts report significant wave height offshore, which is smaller than the wave face you ride. Reports say "chest to shoulder high" rather than quoting a number that invites the wrong comparison.
 - **Audio reports** — on-demand text-to-speech via ElevenLabs
 - **"Suggest a spot"** — inline form that emails a notification and stores the request in Postgres
-- **PWA scaffolding** — manifest + service worker present, install/notification flows not wired up
+- **Installable PWA** — manifest + service worker with offline caching, install prompt, and push notifications wired end to end (per-subscriber condition thresholds, evaluated on each cron run)
 
 ## Architecture
 
@@ -40,6 +42,7 @@ The report pipeline is built to fail safely rather than fail confidently:
 | **Eval harness as a CI gate** | `bun-service/eval/harness.ts` runs golden scenarios against the real model — cross-location and cross-day repetition checks, a specific past-bug repro — and exits non-zero on failure. Wired into [`.github/workflows/eval-prompt.yml`](.github/workflows/eval-prompt.yml) on changes to the prompt/generation code |
 | **Alerting** | Cron failures (whole job or individual locations) email a notification via Resend (`src/app/lib/alerts.ts`) instead of only appearing in Actions logs |
 | **Provenance in the UI** | `SurfReportCard` shows a small notice when a report isn't a normal live-AI report — degraded template, backup model, or stale emergency cache — and stays silent otherwise |
+| **Calibration drift guard** | The Hs→body-scale conversion is duplicated in the Bun service (which deploys separately and can't import from `src/`). Both copies are pinned to an identical golden table in `tests/unit/wave-size.test.ts` and `bun-service/waveSize.test.ts`, so a change to one without the other fails CI |
 | **Readiness health check** | `/api/health` pings the database and the Bun AI service and returns `degraded`/`error` with per-dependency detail, instead of always returning `200` |
 
 ## Tech Stack
@@ -115,13 +118,16 @@ src/app/
 ├── hooks/useSurfReportOptimized.ts # TanStack Query hook (30min staleTime, no auto-refetch)
 ├── lib/
 │   ├── db.ts                       # Neon queries
-│   ├── locations.ts                # The 7 supported locations + their local knowledge
+│   ├── locations.ts                # The 7 locations — local knowledge, coast orientation, buoy calibration
+│   ├── waveSize.ts                 # Hs -> face height -> body-scale descriptor
+│   ├── push.ts                     # Threshold matching + web-push delivery
 │   └── alerts.ts                   # Resend-based reliability alerting
 └── types/surf-report.ts
 
 bun-service/
 ├── index.ts                        # Model fallback ladder, prompt, validation, HTTP handlers
-├── eval/harness.ts                 # Golden-scenario eval harness (CI-gated)
+├── waveSize.test.ts                # Unit tests + drift guard against src/app/lib/waveSize.ts
+├── eval/harness.ts                 # Golden-scenario eval harness (CI-gated, calls real models)
 └── CLAUDE.md
 ```
 
@@ -152,7 +158,7 @@ pnpm type-check   # tsc --noEmit
 pnpm setup-db     # Initialize Neon schema
 ```
 
-Bun service: `bun dev` (hot reload), `bun start`, `bun run eval` (golden-scenario harness).
+Bun service: `bun dev` (hot reload), `bun start`, `bun test` (offline unit tests), `bun run eval` (golden-scenario harness — calls the real models, so it costs money).
 
 ## License
 
