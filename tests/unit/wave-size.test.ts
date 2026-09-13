@@ -78,6 +78,37 @@ describe('describeSize', () => {
   });
 });
 
+/**
+ * DRIFT GUARD — mirrored verbatim in `bun-service/waveSize.test.ts`.
+ *
+ * The Bun service deploys separately and cannot import from this module, so it carries
+ * its own copy of the conversion. This table is duplicated there; if the two
+ * implementations diverge, one of the two suites fails.
+ *
+ * Keep the tables identical. Do not "fix" a failure by editing the expected values
+ * alone — change both implementations, then both tables.
+ */
+const GOLDEN_SIZES: Array<[hsFt: number, periodSec: number, faceFt: number, descriptor: string]> = [
+  [0, 9, 0, 'flat'],
+  [0.5, 8, 0.5, 'flat'],
+  [1, 8, 1.5, 'ankle to knee high'],
+  [1.6, 7.1, 2, 'knee to waist high'],
+  [2.8, 5.8, 3.5, 'waist to chest high'],
+  [2.9, 8.2, 4, 'chest to shoulder high'],
+  [3.1, 8.7, 4.5, 'chest to shoulder high'],
+  [4.5, 12, 6.5, 'overhead'],
+  [8, 16, 12.5, 'double overhead'],
+  [15, 18, 24, 'triple overhead or bigger'],
+];
+
+describe('golden sizes (mirrored in bun-service/waveSize.test.ts)', () => {
+  it.each(GOLDEN_SIZES)('Hs %pft at %ps -> %pft face, %p', (hs, period, face, descriptor) => {
+    const out = describeWaveSize(hs, period);
+    expect(out.face_height_ft).toBe(face);
+    expect(out.size_descriptor).toBe(descriptor);
+  });
+});
+
 describe('describeWaveSize', () => {
   it('keeps Hs intact alongside the derived fields', () => {
     const out = describeWaveSize(3.5, 9);

@@ -31,6 +31,10 @@ Single-file service (`index.ts`) deployed as a Docker container on Coolify. Rece
 **Direct flow:**
 - `POST /generate-surf-report` with `{ surfData, apiKey }` — caller provides surf data directly
 
+**Wave size (`waveSizeOf`):** `details.wave_height_ft` is significant wave height (Hs) measured offshore — **not** the face of the wave a surfer rides, which is reliably larger. The prompt is given a body-scale label ("waist to chest high") as `Surf Size` and explicitly instructed not to quote a size in feet, because quoting Hs understates the surf. `/api/surfability` supplies `face_height_ft` and `size_descriptor`; `waveSizeOf` prefers those and recomputes from Hs only when they're absent (older payloads). The conversion mirrors `src/app/lib/waveSize.ts` in the Next.js app — this service deploys separately and can't import from it, so `waveSize.test.ts` here and `tests/unit/wave-size.test.ts` there share an identical golden table as a drift guard. Change both implementations, then both tables.
+
+**Tests** (`bun test`): unit tests for `waveSizeOf`, including the drift guard above. Cheap and offline — unlike the eval harness, these call no models.
+
 **Eval harness** (`eval/harness.ts`, run with `bun run eval`): runs golden scenarios against the real model and asserts on the output — `validateReportText` issues, cross-location and cross-day text-repetition checks, and whether any scenario fell through to the deterministic template. Exits non-zero on failure, so it's wired into `.github/workflows/eval-prompt.yml` as a CI gate on changes to `index.ts` or `eval/**`, in addition to being runnable by hand.
 
 ## Deployment

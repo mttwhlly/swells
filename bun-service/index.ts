@@ -190,9 +190,52 @@ function getTideContext(tideState: string): string {
   return 'Mid tide — typically the most consistent window.'
 }
 
-function getBoardTypeRecommendation(waveHeight: number): string {
-  if (waveHeight >= 4) return 'Shortboard recommended'
-  if (waveHeight >= 2.5) return 'Shortboard or funboard'
+/**
+ * Wave size, translated for humans.
+ *
+ * `details.wave_height_ft` is significant wave height (Hs) measured offshore — NOT the
+ * height of the wave face a surfer rides, which is reliably larger. /api/surfability now
+ * supplies `face_height_ft` and `size_descriptor` alongside it; this reads those when
+ * present and recomputes them otherwise, so an older payload never leaves us describing
+ * Hs as though it were the face.
+ *
+ * Source of truth for the conversion is src/app/lib/waveSize.ts in the Next.js app. This
+ * service deploys separately (its own Docker image, base dir /bun-service) and cannot
+ * import from it, so the fallback below is a deliberate mirror — keep the two in step.
+ */
+export function waveSizeOf(surfData: any): { faceHeightFt: number; descriptor: string } {
+  const d = surfData?.details ?? {}
+  if (typeof d.face_height_ft === 'number' && typeof d.size_descriptor === 'string') {
+    return { faceHeightFt: d.face_height_ft, descriptor: d.size_descriptor }
+  }
+
+  const hs = typeof d.wave_height_ft === 'number' ? d.wave_height_ft : 0
+  const period = typeof d.wave_period_sec === 'number' && d.wave_period_sec > 0 ? d.wave_period_sec : 8
+  if (!(hs > 0)) return { faceHeightFt: 0, descriptor: 'flat' }
+
+  const shoaling = period <= 6 ? 1.05 : period >= 16 ? 1.25 : 1.05 + ((period - 6) / 10) * 0.2
+  const face = Math.round(hs * 1.27 * shoaling * 2) / 2
+
+  const bands: Array<[number, string]> = [
+    [1, 'flat'],
+    [2, 'ankle to knee high'],
+    [3, 'knee to waist high'],
+    [4, 'waist to chest high'],
+    [5, 'chest to shoulder high'],
+    [6.5, 'shoulder to head high'],
+    [8, 'overhead'],
+    [12, 'well overhead'],
+    [18, 'double overhead'],
+  ]
+  for (const [max, label] of bands) {
+    if (face < max) return { faceHeightFt: face, descriptor: label }
+  }
+  return { faceHeightFt: face, descriptor: 'triple overhead or bigger' }
+}
+
+function getBoardTypeRecommendation(faceHeightFt: number): string {
+  if (faceHeightFt >= 5.5) return 'Shortboard recommended'
+  if (faceHeightFt >= 3.5) return 'Shortboard or funboard'
   return 'Longboard recommended'
 }
 
@@ -238,6 +281,7 @@ function pickOpeningAngle(): string {
 
 export function createDetailedSurfPrompt(surfData: any, ctx: LocationContext, now: Date = new Date()): string {
   const windMph = Math.round(surfData.details.wind_speed_kts * 1.15078)
+  const waveSize = waveSizeOf(surfData)
   const swellDirection = getCompassDirection(surfData.details.swell_direction_deg)
   const windDirection = getCompassDirection(surfData.details.wind_direction_deg)
   const windOnshoreOffshore = surfData.details.wind_direction_description ?? null
@@ -300,7 +344,7 @@ RECOMMENDED SPOTS:
 ${ctx.bestSpots.join(', ')}
 
 CURRENT CONDITIONS (raw data — reference in your own words, see NOTE below on the two hint lines):
-• Wave Height: ${surfData.details.wave_height_ft} feet
+• Surf Size: ${waveSize.descriptor} (this is the size to describe to the reader)
 • Wave Period: ${surfData.details.wave_period_sec} seconds
 • Swell Direction: ${surfData.details.swell_direction_deg}° (${swellDirection})
 • Wind: ${windMph} mph ${windDirection}${windOnshoreOffshore ? `
@@ -309,7 +353,7 @@ CURRENT CONDITIONS (raw data — reference in your own words, see NOTE below on 
 • Water Temp: ${surfData.weather.water_temperature_f}°F
 • Weather: ${surfData.weather.weather_description}
 • Overall Score: ${surfData.score}/100
-• Wave Quality (hint, not a sentence to reuse): ${getWaveQuality(surfData.details.wave_height_ft, surfData.details.wave_period_sec)}
+• Wave Quality (hint, not a sentence to reuse): ${getWaveQuality(waveSize.faceHeightFt, surfData.details.wave_period_sec)}
 • Tide Context (hint, not a sentence to reuse): ${getTideContext(surfData.details.tide_state)}
 • Local Date: ${localDate}
 • Local Time: ${localTime}
@@ -317,6 +361,7 @@ CURRENT CONDITIONS (raw data — reference in your own words, see NOTE below on 
 • Session Status: ${viabilityNote}
 ${viabilityInstructions}
 NOTE: Do not restate raw figures verbatim in prose (wave height, period, temperature, wind speed, etc.) — interpret and contextualise what they mean for the surf experience instead.
+NOTE ON SIZE: Describe the surf using the body scale given in Surf Size ("waist to chest high", "overhead", and so on), or your own natural equivalent. Do NOT give the size as a number of feet. Forecast models measure significant wave height offshore, which is a smaller number than the face of the wave a surfer actually rides, so quoting feet here would understate the surf and mislead the reader. The body-scale label already accounts for that difference.
 NOTE: The "Wave Quality" and "Tide Context" lines above are internal hints describing what the numbers mean, not sentences to paraphrase or echo. Reach your own conclusion about the surf in your own words — do not restate their wording or sentence shape.
 NOTE: Do not state any date, day-of-week, season, or "time of year" framing, and do not claim conditions are typical/atypical for the season — unless it is directly supported by the data given above. If you reference the day or date, it must match Local Date exactly.
 
@@ -341,6 +386,8 @@ TONE: ${ctx.voiceDescriptor}. Use some surf slang but keep it readable.`
 function reportConditions(surfData: any) {
   return {
     wave_height_ft: surfData.details.wave_height_ft,
+    face_height_ft: waveSizeOf(surfData).faceHeightFt,
+    size_descriptor: waveSizeOf(surfData).descriptor,
     wave_period_sec: surfData.details.wave_period_sec,
     wind_speed_kts: surfData.details.wind_speed_kts,
     wind_direction_deg: surfData.details.wind_direction_deg,
@@ -454,7 +501,7 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
     report: fallbackReport,
     conditions: reportConditions(surfData),
     recommendations: {
-      board_type: getBoardTypeRecommendation(surfData.details.wave_height_ft),
+      board_type: getBoardTypeRecommendation(waveSizeOf(surfData).faceHeightFt),
       wetsuit_thickness: surfData.weather.water_temperature_f < 65 ? '3/2mm'
         : surfData.weather.water_temperature_f < 72 ? 'Spring suit'
         : undefined,
@@ -479,13 +526,14 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
   if (!viability.viable) {
     if (viability.reason === 'lightning') {
       const p1 = `Lightning and thunderstorm activity means the ocean is unsafe right now — stay out of the water. No surf session is worth the risk during an electrical storm.`
-      const p2 = `Keep an eye on the radar and check back once the storm fully clears. The ${surfData.details.wave_height_ft}ft swell at ${surfData.details.wave_period_sec}s should still be around once it's safe to paddle out.`
+      const p2 = `Keep an eye on the radar and check back once the storm fully clears. The ${waveSizeOf(surfData).descriptor} swell at ${surfData.details.wave_period_sec}s should still be around once it's safe to paddle out.`
       return `${p1}\n\n${p2}`
     }
-    const waveDesc = surfData.details.wave_height_ft >= 4 ? 'solid' : surfData.details.wave_height_ft >= 2 ? 'fun-sized' : 'small'
+    // Body scale, not feet — wave_height_ft is offshore Hs, not the face a surfer rides.
+    const nightSize = waveSizeOf(surfData).descriptor
     const p1 = viability.isPreDawn
-      ? `Still too dark to surf at ${ctx.locationName} — sunrise is around ${viability.riseStr}. If you're still curious, the current snapshot shows ${waveDesc} ${surfData.details.wave_height_ft}ft waves at ${surfData.details.wave_period_sec}s from the ${surfData.details.swell_direction_compass || 'east'} with ${windMph} mph ${surfData.details.wind_direction_compass || 'variable'} winds, but that's right now — not a forecast for once it's light.`
-      : `It's dark out — no surfing tonight at ${ctx.locationName}. If you're still curious, the current snapshot shows ${waveDesc} ${surfData.details.wave_height_ft}ft waves at ${surfData.details.wave_period_sec}s from the ${surfData.details.swell_direction_compass || 'east'} with ${windMph} mph ${surfData.details.wind_direction_compass || 'variable'} winds, but that's right now — not a forecast for tomorrow.`
+      ? `Still too dark to surf at ${ctx.locationName} — sunrise is around ${viability.riseStr}. If you're still curious, the current snapshot shows ${nightSize} waves at ${surfData.details.wave_period_sec}s from the ${surfData.details.swell_direction_compass || 'east'} with ${windMph} mph ${surfData.details.wind_direction_compass || 'variable'} winds, but that's right now — not a forecast for once it's light.`
+      : `It's dark out — no surfing tonight at ${ctx.locationName}. If you're still curious, the current snapshot shows ${nightSize} waves at ${surfData.details.wave_period_sec}s from the ${surfData.details.swell_direction_compass || 'east'} with ${windMph} mph ${surfData.details.wind_direction_compass || 'variable'} winds, but that's right now — not a forecast for tomorrow.`
     const p2 = viability.isPreDawn
       ? `Check back once the sun's up (~${viability.riseStr}) for an accurate read on conditions. No guessing in the dark.`
       : `Check back tomorrow for an accurate read on conditions. Night surf isn't worth it, and neither is guessing.`
@@ -493,12 +541,13 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
   }
 
   const condition = surfData.score >= 70 ? 'good' : surfData.score >= 50 ? 'fair' : 'poor'
-  const waveDesc = surfData.details.wave_height_ft >= 4 ? 'solid' : surfData.details.wave_height_ft >= 2 ? 'fun-sized' : 'small'
+  // Body scale, not feet — wave_height_ft is offshore Hs, not the face a surfer rides.
+  const waveDesc = waveSizeOf(surfData).descriptor
   const swellCompass = surfData.details.swell_direction_compass || 'unknown direction'
   const windCompass = surfData.details.wind_direction_compass || 'variable'
   const primarySpot = ctx.bestSpots[0] || ctx.locationName
 
-  const paragraph1 = `${ctx.locationName} surf check shows ${waveDesc} ${surfData.details.wave_height_ft}ft waves at ${surfData.details.wave_period_sec} seconds coming from the ${swellCompass}, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some nice long rides' : 'quicker, choppier waves with less power'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean, glassy conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} at ${surfData.details.tide_height_ft}ft and water temp is ${surfData.weather.water_temperature_f}°F.`
+  const paragraph1 = `${ctx.locationName} surf check shows ${waveDesc} waves at ${surfData.details.wave_period_sec} seconds coming from the ${swellCompass}, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some nice long rides' : 'quicker, choppier waves with less power'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean, glassy conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} at ${surfData.details.tide_height_ft}ft and water temp is ${surfData.weather.water_temperature_f}°F.`
 
   const tideNote = surfData.details.tide_state.includes('Rising')
     ? 'Tide is rising which often cleans things up — worth getting out sooner'
