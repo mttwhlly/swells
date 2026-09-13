@@ -132,7 +132,7 @@ function getRandomRating(category: keyof typeof surfRatings): string {
   return options[Math.floor(Math.random() * options.length)];
 }
 
-function calculateSurfability(data: SurfData) {
+function calculateSurfability(data: SurfData, coastFacingDeg: number) {
   let score = 0;
 
   if (data.waveHeight >= 2 && data.waveHeight <= 8) score += 25;
@@ -142,11 +142,16 @@ function calculateSurfability(data: SurfData) {
   else if (data.wavePeriod >= 7) score += 20;
   else if (data.wavePeriod >= 5) score += 10;
 
-  if (data.swellDirection >= 45 && data.swellDirection <= 135) score += 20;
-  else if (data.swellDirection >= 30 && data.swellDirection <= 150) score += 10;
+  // Score the swell by how squarely it meets *this* coast, matching the bands
+  // getSwellDirectionDescription reports. (Previously hardcoded to 45–135°, i.e.
+  // an east-facing Florida beach, which inverted the score everywhere else.)
+  let swellDiff = Math.abs(data.swellDirection - coastFacingDeg);
+  if (swellDiff > 180) swellDiff = 360 - swellDiff;
+  if (swellDiff <= 45) score += 20;
+  else if (swellDiff <= 90) score += 10;
 
   if (data.windSpeed < 5) score += 15;
-  else if (data.windDirection >= 225 && data.windDirection <= 315) {
+  else if (isOffshoreWind(data.windDirection, coastFacingDeg)) {
     if (data.windSpeed <= 15) score += 20;
     else score += 10;
   } else if (data.windSpeed < 10) score += 10;
@@ -215,7 +220,7 @@ function calculateTideState(
   return currentHeight > 2.0 ? 'High' : currentHeight < 1.0 ? 'Low' : 'Mid';
 }
 
-function findCurrentMarineData(marineData: MarineApiResponse) {
+function findCurrentMarineData(marineData: MarineApiResponse, waveHeightCalibration: number) {
   console.log('🔍 Processing marine data...');
 
   if (!marineData?.hourly?.time) {
@@ -249,15 +254,17 @@ function findCurrentMarineData(marineData: MarineApiResponse) {
   if (wavePeriod < 2 || wavePeriod > 25) throw new Error(`Wave period ${wavePeriod}s outside reasonable bounds`);
   if (waterTemp < -5 || waterTemp > 40) throw new Error(`Water temperature ${waterTemp}°C outside reasonable bounds`);
 
+  // Bounds are checked against the raw model value above; the calibration is applied
+  // afterwards so a bad fitted factor can't mask an implausible reading from the model.
   return {
-    waveHeight: waveHeight * 3.28084,
+    waveHeight: waveHeight * waveHeightCalibration * 3.28084,
     wavePeriod,
     swellDirection,
     waterTemp
   };
 }
 
-async function fetchMarineData(lat: number, lon: number, timezone: string) {
+async function fetchMarineData(lat: number, lon: number, timezone: string, waveHeightCalibration: number) {
   const params = `latitude=${lat}&longitude=${lon}&hourly=wave_height,wave_period,swell_wave_direction,sea_surface_temperature&timezone=${encodeURIComponent(timezone)}`;
 
   try {
@@ -265,7 +272,7 @@ async function fetchMarineData(lat: number, lon: number, timezone: string) {
       `https://api.open-meteo.com/v1/marine?${params}`,
       { cache: 'no-store', signal: AbortSignal.timeout(12000) }
     );
-    if (res.ok) return findCurrentMarineData(await res.json());
+    if (res.ok) return findCurrentMarineData(await res.json(), waveHeightCalibration);
   } catch {}
 
   try {
@@ -273,7 +280,7 @@ async function fetchMarineData(lat: number, lon: number, timezone: string) {
       `https://marine-api.open-meteo.com/v1/marine?${params}`,
       { cache: 'no-store', signal: AbortSignal.timeout(12000) }
     );
-    if (res.ok) return findCurrentMarineData(await res.json());
+    if (res.ok) return findCurrentMarineData(await res.json(), waveHeightCalibration);
   } catch {}
 
   throw new Error('All marine data sources failed - no real ocean data available');
@@ -397,7 +404,7 @@ export async function GET(request: NextRequest) {
     // Debug parameter
     if (request.nextUrl.searchParams.get('debug') === 'water-temp') {
       try {
-        const debugResult = await fetchMarineData(location.lat, location.lon, location.timezone);
+        const debugResult = await fetchMarineData(location.lat, location.lon, location.timezone, location.waveHeightCalibration);
         return NextResponse.json({ debug: true, waterTempResult: debugResult, timestamp: new Date().toISOString() });
       } catch (error) {
         return NextResponse.json({ debug: true, error: error instanceof Error ? error.message : 'Unknown error' }, { status: 503 });
@@ -407,7 +414,7 @@ export async function GET(request: NextRequest) {
     // Step 1: Marine data
     let marineData;
     try {
-      marineData = await fetchMarineData(location.lat, location.lon, location.timezone);
+      marineData = await fetchMarineData(location.lat, location.lon, location.timezone, location.waveHeightCalibration);
     } catch (error) {
       return NextResponse.json({
         error: 'Real marine conditions unavailable',
@@ -463,7 +470,7 @@ export async function GET(request: NextRequest) {
       tideHeight: tideData.currentHeight,
     };
 
-    const { score, surfable, funRating } = calculateSurfability(currentSurfData);
+    const { score, surfable, funRating } = calculateSurfability(currentSurfData, location.coastFacingDeg);
 
     const formatTideTime = (tideEvent: { time: string; height: number; timestamp: string } | null) => {
       if (!tideEvent) return null;

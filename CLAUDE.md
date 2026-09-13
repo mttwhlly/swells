@@ -65,6 +65,19 @@ Report generation is **not done inside Next.js**. The `BUN_SERVICE_URL` env var 
 
 `/api/surfability` will 503 if any real data source fails; it has no fallback estimates (strict by design).
 
+#### Wave height calibration
+
+Open-Meteo's modelled significant wave height carries a systematic, **location-specific** bias — it resolves open water rather than the shoaling and refraction each beach sits behind. Measured against the nearest NDBC wave buoy over ~30 days (Sept 2026), `best_match` ran 43% low at St. Augustine, 25% low at Rockaway, and 25% high on Oahu's North Shore, while being essentially unbiased in Maine.
+
+Each location therefore carries a `waveHeightCalibration` multiplier in `locations.ts`, applied in `findCurrentMarineData` *after* the plausibility bounds are checked against the raw model value. Factors were fitted as `mean(buoy Hs) / mean(model Hs)` and validated out-of-sample (fit on the first half of the window, test on the second); only factors that measurably beat no correction were adopted, the rest are pinned to `1.0` with the fit recorded in a comment. At St. Augustine this cut out-of-sample RMSE from 0.34m to 0.12m.
+
+Two caveats worth knowing:
+
+- **These drift.** They are fitted on a single late-summer window and should be re-fitted periodically, not treated as constants. `calibrationBuoyId` and `calibrationFittedOn` record the provenance for each.
+- **Don't "fix" this by switching wave models instead.** `ncep_gfswave025` is markedly better than `best_match` on the East Coast but returns a hardcoded `0.00m` at Oahu (it resolves a land cell there), and the route's `waveHeight > 30` guard would not catch a flat zero — it would silently report "flat" forever.
+
+Note that `wave_period` from Open-Meteo tracks the buoy's *dominant/peak* period (DPD) within ~1s, not the average period — so it is already the quantity surf forecasts quote, and needs no correction.
+
 ### Frontend
 
 `page.tsx` (server component) → `SurfAppClient.tsx` (client component) → `useSurfReportOptimized` hook (TanStack Query) → `/api/surf-report`
