@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint .",
     "setup-db": "tsx scripts/setup-neon.ts",
+    "refit-calibration": "tsx scripts/refit-calibration.ts",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
