@@ -1,0 +1,92 @@
+name: Refit Wave Calibrations
+
+# The per-location waveHeightCalibration factors in src/app/lib/locations.ts correct a
+# systematic bias in Open-Meteo's modelled wave height. They were fitted on a single
+# late-summer window and are expected to drift, so this runs the refit quarterly and
+# opens an issue with the results. It never edits locations.ts — applying a new factor
+# is a deliberate manual change.
+
+on:
+  schedule:
+    - cron: '0 13 1 3,6,9,12 *' # 1st of Mar/Jun/Sep/Dec, 13:00 UTC
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Window length in days (7-45)'
+        required: false
+        default: '30'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  refit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Run refit
+        id: refit
+        run: |
+          # NDBC and Open-Meteo are both public and occasionally flaky. Capture whatever
+          # the script produces so the issue still gets opened and says what went wrong.
+          set +e
+          pnpm refit-calibration --days "${{ inputs.days || '30' }}" > refit-output.txt 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          cat refit-output.txt
+
+      - name: Open refit issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXIT_CODE: ${{ steps.refit.outputs.exit_code }}
+        run: |
+          QUARTER="Q$(( ($(date -u +%-m) - 1) / 3 + 1 )) $(date -u +%Y)"
+
+          {
+            echo "The wave height calibration factors in \`src/app/lib/locations.ts\` are"
+            echo "fitted on a single seasonal window and drift. This is the ${QUARTER} refit."
+            echo ""
+
+            if [ "$EXIT_CODE" != "0" ]; then
+              echo "> [!WARNING]"
+              echo "> The refit script exited \`${EXIT_CODE}\`. Output below may be incomplete."
+              echo ""
+            fi
+
+            echo '```'
+            cat refit-output.txt
+            echo '```'
+            echo ""
+            echo "## What to do"
+            echo ""
+            echo "1. Re-run locally to confirm: \`pnpm refit-calibration\`"
+            echo "2. For each location flagged \`* drifted\`, sanity-check the buoy is alive and"
+            echo "   the window isn't dominated by one storm (try \`--days 45\` to compare)."
+            echo "3. Apply only factors that beat no correction out-of-sample. Pin the rest to \`1.00\`."
+            echo "4. Update \`waveHeightCalibration\`, \`calibrationFittedOn\`, and the fit comment together."
+            echo "5. Re-run \`pnpm test\` — the wave-size golden tables should be unaffected, but the"
+            echo "   surfability tests exercise the calibration path."
+            echo ""
+            echo "Background: the \"Wave height calibration\" section of \`CLAUDE.md\`."
+            echo ""
+            echo "<sub>Opened automatically by \`.github/workflows/refit-calibration.yml\`.</sub>"
+          } > issue-body.md
+
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Refit wave height calibrations — ${QUARTER}" \
+            --body-file issue-body.md
