@@ -78,19 +78,26 @@ The service runs a model ladder — Claude Haiku (`@ai-sdk/anthropic`) primary, 
 
 #### Wave height calibration
 
-Open-Meteo's modelled significant wave height carries a systematic, **location-specific** bias — it resolves open water rather than the shoaling and refraction each beach sits behind. Measured against the nearest NDBC wave buoy over ~30 days (Sept 2026), `best_match` ran 43% low at St. Augustine, 25% low at Rockaway, and 25% high on Oahu's North Shore, while being essentially unbiased in Maine.
+Open-Meteo's modelled significant wave height carries a systematic, **location-specific** bias — it resolves open water rather than the shoaling and refraction each beach sits behind. Measured against the nearest NDBC wave buoy over 2024–2025, `best_match` runs 44% low at St. Augustine, 48% low at Folly Beach, 29% low at Rockaway, 12% low in Maine, 12% high on Oahu's North Shore, and 49% high at Boca Raton.
 
-Each location therefore carries a `waveHeightCalibration` multiplier in `locations.ts`, applied in `findCurrentMarineData` *after* the plausibility bounds are checked against the raw model value. Factors were fitted as `mean(buoy Hs) / mean(model Hs)` and validated out-of-sample (fit on the first half of the window, test on the second); only factors that measurably beat no correction were adopted, the rest are pinned to `1.0` with the fit recorded in a comment. At St. Augustine this cut out-of-sample RMSE from 0.34m to 0.12m.
+Each location carries a `waveHeightCalibration` multiplier in `locations.ts`, applied in `findCurrentMarineData` *after* the plausibility bounds are checked against the raw model value. Factors are `mean(buoy Hs) / mean(model Hs)` over two complete calendar years, validated out-of-sample by fitting on the first year and scoring on the second. Only factors that beat no correction are adopted; the rest are pinned to `1.0`. `calibrationBuoyId`, `calibrationFittedOn` and `calibrationWindow` record the provenance for each.
 
-Two caveats worth knowing:
+Three things worth knowing:
 
-- **These drift.** They are fitted on a single late-summer window and should be re-fitted periodically, not treated as constants. `calibrationBuoyId` and `calibrationFittedOn` record the provenance for each.
+- **The fitting window matters more than the refit interval.** The bias is strongly seasonal — winter high, summer low, swinging 15–53% across the year — but the *same calendar month* repeats to within 3–7% year over year. So a factor fitted over a single month encodes whichever season it was fitted in and then applies it year-round.
 
-  Run `pnpm refit-calibration` to re-fit against fresh data (`--days 7..45`, `--location <slug>`, `--json`). It pulls NDBC's realtime2 feed (~45 days of observations) and Open-Meteo's `best_match` model for the same window, pairs them on the UTC hour, fits on the first half and validates on the second — the same method the original factors came from, so results are comparable. It **reports only**; applying a factor is a manual edit to `locations.ts`, so a thin or storm-dominated window can't silently change what the site reports. Locations whose suggested factor moves more than 5% are flagged, with the replacement comment and field values printed ready to paste.
+  This is not hypothetical: the first generation of factors was fitted on one September window and was materially wrong at four locations. `higgins-beach` was pinned to `1.00` as "already unbiased" while actually running ~12% low in every month of both years, and **Oahu's September-fitted `0.78` was worse than applying no correction at all** (out-of-sample RMSE 0.371m vs 0.272m) because September is Oahu's annual minimum. Fixed in [#56](https://github.com/mttwhlly/swells/pull/56).
 
-  `.github/workflows/refit-calibration.yml` runs this quarterly (1st of Mar/Jun/Sep/Dec) and opens an issue with the output. It has no secrets and touches no code.
+  Derive replacement factors with `pnpm calibration-seasonality --recommend` over full years — never from a short window.
 
-  `pnpm calibration-seasonality` answers the question behind the cadence: it pulls two full calendar years (NDBC's historical archive plus matching Open-Meteo output, cached under `.cache/`) and reports how the factor moves across the year. `--validate` compares correction schemes out of sample (fit one year, score the next); `--recommend` prints paste-ready factors fitted over every year requested. **The 2024–2025 run found the shipped September-fitted factors are materially wrong at four locations** — see [#55](https://github.com/mttwhlly/swells/pull/55). The bias is strongly seasonal (winter high, summer low, 15–53% swing) but repeats year over year to within 3–7%, which means a one-month fitting window is the problem, not the refit interval.
+- **Two tools, different jobs.**
+
+  `pnpm calibration-seasonality` is the one that *sets* factors. It pulls complete calendar years (NDBC's historical archive plus matching Open-Meteo output, cached under `.cache/`) and reports how the factor moves across the year. `--validate` compares correction schemes out of sample; `--recommend` prints paste-ready values. Per-quarter factors would beat the current annual constants at `folly-beach` (−8%), `oahu` (−11%) and `huntington-beach` (−6%) — that's the open opportunity, and it needs a schema change. Elsewhere quarterly is a wash, and monthly never beats quarterly by more than the third decimal.
+
+  `pnpm refit-calibration` (`--days 7..45`) is a *monitor*, run quarterly by `.github/workflows/refit-calibration.yml`. Its window is too short to set a factor. What it catches is a decommissioned buoy, a station that stopped reporting `WVHT`, or a genuine regime change. Both tools report only — applying a factor is always a manual edit to `locations.ts`.
+
+- **`boca-raton` is the weak one.** 74% seasonal amplitude with an 18% year-over-year gap, plus whole months missing from buoy 41122's record. No nearer wave buoy exists (`pvgf1`/`lkwf1`/`pegf1` are ~29km but met-only). Its factor is a compromise, not a measurement, and no refit schedule improves it.
+
 - **Don't "fix" this by switching wave models instead.** `ncep_gfswave025` is markedly better than `best_match` on the East Coast but returns a hardcoded `0.00m` at Oahu (it resolves a land cell there), and the route's `waveHeight > 30` guard would not catch a flat zero — it would silently report "flat" forever.
 
 Note that `wave_period` from Open-Meteo tracks the buoy's *dominant/peak* period (DPD) within ~1s, not the average period — so it is already the quantity surf forecasts quote, and needs no correction.
