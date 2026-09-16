@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "setup-db": "tsx scripts/setup-neon.ts",
     "refit-calibration": "tsx scripts/refit-calibration.ts",
+    "calibration-seasonality": "tsx scripts/calibration-seasonality.ts",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
