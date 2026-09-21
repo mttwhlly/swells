@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getCachedReport, saveReport, ensureInitialized } from '@/lib/db';
-import { getLocation, DEFAULT_LOCATION_SLUG, type Location } from '@/lib/locations';
+import { getLocation, DEFAULT_LOCATION_SLUG, pickEarnedSpotFeatures, type Location, type ShinesWhenData } from '@/lib/locations';
 import type { SurfReport } from '@/types/surf-report';
 import { describeWaveSize } from '@/lib/waveSize';
 
@@ -247,7 +247,7 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
           board_type: waveSizeFor(surfData).face_height_ft >= 4 ? 'Shortboard' : 'Longboard',
           wetsuit_thickness: surfData.weather.water_temperature_f < 65 ? '3/2mm' : surfData.weather.water_temperature_f < 72 ? 'Spring suit' : undefined,
           skill_level: surfData.score >= 65 ? 'intermediate' : 'beginner',
-          best_spots: location.spotFeatures.map(f => pickExample(f.examples)),
+          best_spots: pickEarnedSpotFeatures(location.spotFeatures, shinesWhenDataFrom(surfData)).map(f => pickExample(f.examples)),
           timing_advice: 'Check conditions regularly as they change throughout the day'
         },
         cached_until: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
@@ -304,6 +304,17 @@ function waveSizeFor(surfData: SurfabilityData) {
   return describeWaveSize(wave_height_ft, wave_period_sec);
 }
 
+/** The subset of a surfability payload shinesWhenConditions are checked against. */
+function shinesWhenDataFrom(surfData: SurfabilityData): ShinesWhenData {
+  return {
+    swellDirectionCompass: surfData.details.swell_direction_compass,
+    windDirectionDescription: surfData.details.wind_direction_description,
+    waveHeightFt: surfData.details.wave_height_ft,
+    wavePeriodSec: surfData.details.wave_period_sec,
+    tideState: surfData.details.tide_state,
+  };
+}
+
 function createDetailedFallbackReport(surfData: SurfabilityData, windMph: number, location: Location): string {
   const condition = surfData.score >= 70 ? 'good' : surfData.score >= 50 ? 'fair' : 'poor';
   // Speak in body scale, not in feet: the underlying number is offshore significant wave
@@ -311,12 +322,25 @@ function createDetailedFallbackReport(surfData: SurfabilityData, windMph: number
   const size = waveSizeFor(surfData);
   const swellCompass = surfData.details.swell_direction_compass || 'unknown direction';
   const windCompass = surfData.details.wind_direction_compass || 'variable';
-  const primarySpot = (location.spotFeatures[0] ? pickExample(location.spotFeatures[0].examples) : undefined) || location.name;
-  const secondarySpot = (location.spotFeatures[1] ? pickExample(location.spotFeatures[1].examples) : undefined) || location.name;
+
+  // Only name a spot when today's real data actually earns it (matches its
+  // shinesWhenConditions, or it's unconditional) — guessing by array position is exactly
+  // the dishonest "overconfident beach pick" this mechanism replaces.
+  const earned = pickEarnedSpotFeatures(location.spotFeatures, shinesWhenDataFrom(surfData));
+  const primarySpot = earned[0] ? pickExample(earned[0].examples) : undefined;
+  const secondarySpot = earned[1] ? pickExample(earned[1].examples) : undefined;
 
   const paragraph1 = `${location.name} surf check shows ${size.size_descriptor} waves at ${surfData.details.wave_period_sec} seconds from ${swellCompass} direction, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some long rides' : 'quicker, choppier waves with less push'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} and water temp is ${surfData.weather.water_temperature_f}°F.`;
 
-  const paragraph2 = `${size.face_height_ft >= 4 ? `Grab your shortboard and head to ${primarySpot} where the waves should have some punch` : `${primarySpot} or ${secondarySpot} should find a way to produce rideable waves on a day like this`}. ${surfData.weather.water_temperature_f < 65 ? 'You\'ll want a 3/2mm or thicker wetsuit for that cold water' : surfData.weather.water_temperature_f < 72 ? 'A spring suit should be fine' : 'Boardshorts or spring suit territory — comfortable water temps'}. ${condition === 'good' ? 'Definitely worth the paddle out today!' : condition === 'fair' ? 'Surfable if you need your wave fix.' : 'Might be better for a beach walk, but conditions can change quickly.'}`;
+  const spotClause = !primarySpot
+    ? `Today's setup doesn't clearly favor one spot over another here — worth checking a few stretches`
+    : size.face_height_ft >= 4
+      ? `Grab your shortboard and head to ${primarySpot} where the waves should have some punch`
+      : secondarySpot
+        ? `${primarySpot} or ${secondarySpot} should find a way to produce rideable waves on a day like this`
+        : `${primarySpot} should find a way to produce rideable waves on a day like this`;
+
+  const paragraph2 = `${spotClause}. ${surfData.weather.water_temperature_f < 65 ? 'You\'ll want a 3/2mm or thicker wetsuit for that cold water' : surfData.weather.water_temperature_f < 72 ? 'A spring suit should be fine' : 'Boardshorts or spring suit territory — comfortable water temps'}. ${condition === 'good' ? 'Definitely worth the paddle out today!' : condition === 'fair' ? 'Surfable if you need your wave fix.' : 'Might be better for a beach walk, but conditions can change quickly.'}`;
 
   return `${paragraph1}\n\n${paragraph2}`;
 }

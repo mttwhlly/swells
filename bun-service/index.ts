@@ -262,12 +262,56 @@ function getFallbackTimingAdvice(tideState: string, viability: SessionViability)
   return 'Mid to outgoing tide usually favours the local breaks — check tide charts for timing'
 }
 
-// Mirrors SpotFeature in src/app/lib/locations.ts — this service deploys separately and
-// can't import from src/, so it carries its own copy of the shape (not the data).
+// Mirrors SpotFeature/SpotShinesCondition/ShinesWhenData/pickEarnedSpotFeatures in
+// src/app/lib/locations.ts — this service deploys separately and can't import from
+// src/, so it carries its own copy of the shape and the matching logic (not the data,
+// which arrives per-request from the Next.js app; eval/harness.ts carries its own copy
+// of the data for its hardcoded scenarios).
 export interface SpotFeature {
   archetype: string;
   examples: string[];
   shinesWhen: string;
+  shinesWhenConditions?: SpotShinesCondition[];
+}
+
+export interface SpotShinesCondition {
+  swellFrom?: string[];
+  minWaveHeightFt?: number;
+  maxWaveHeightFt?: number;
+  minPeriodSec?: number;
+  maxPeriodSec?: number;
+  tideIncludes?: string[];
+  wind?: 'onshore' | 'offshore';
+}
+
+export interface ShinesWhenData {
+  swellDirectionCompass: string;
+  windDirectionDescription: string;
+  waveHeightFt: number;
+  wavePeriodSec: number;
+  tideState: string;
+}
+
+function matchesCondition(condition: SpotShinesCondition, data: ShinesWhenData): boolean {
+  if (condition.swellFrom && !condition.swellFrom.includes(data.swellDirectionCompass)) return false
+  if (condition.minWaveHeightFt !== undefined && data.waveHeightFt < condition.minWaveHeightFt) return false
+  if (condition.maxWaveHeightFt !== undefined && data.waveHeightFt > condition.maxWaveHeightFt) return false
+  if (condition.minPeriodSec !== undefined && data.wavePeriodSec < condition.minPeriodSec) return false
+  if (condition.maxPeriodSec !== undefined && data.wavePeriodSec > condition.maxPeriodSec) return false
+  if (condition.tideIncludes && !condition.tideIncludes.some(t => data.tideState.includes(t))) return false
+  if (condition.wind && !data.windDirectionDescription.toLowerCase().includes(condition.wind)) return false
+  return true
+}
+
+// Which spotFeatures are genuinely earned by today's real data, for the deterministic
+// (non-AI) fallback report. An archetype with no shinesWhenConditions is always
+// eligible; one with conditions is eligible only when at least one OR'd group matches.
+// Can return an empty array — the honest answer when nothing is earned is to name no
+// spot, not to guess one by array position.
+export function pickEarnedSpotFeatures(spotFeatures: SpotFeature[], data: ShinesWhenData): SpotFeature[] {
+  return spotFeatures.filter(f =>
+    !f.shinesWhenConditions?.length || f.shinesWhenConditions.some(c => matchesCondition(c, data))
+  )
 }
 
 // Several examples per archetype are often genuinely interchangeable — pick one at
@@ -275,6 +319,16 @@ export interface SpotFeature {
 // so the report doesn't repeatedly name the same beach just because it's listed first.
 function pickExample(examples: string[]): string {
   return examples[Math.floor(Math.random() * examples.length)] ?? examples[0]!
+}
+
+function shinesWhenDataFrom(surfData: any): ShinesWhenData {
+  return {
+    swellDirectionCompass: surfData.details.swell_direction_compass,
+    windDirectionDescription: surfData.details.wind_direction_description,
+    waveHeightFt: surfData.details.wave_height_ft,
+    wavePeriodSec: surfData.details.wave_period_sec,
+    tideState: surfData.details.tide_state,
+  }
 }
 
 export interface LocationContext {
@@ -535,7 +589,7 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
         : surfData.weather.water_temperature_f < 72 ? 'Spring suit'
         : undefined,
       skill_level: surfData.score >= 65 ? 'intermediate' : 'beginner',
-      best_spots: ctx.spotFeatures.map(f => pickExample(f.examples)),
+      best_spots: pickEarnedSpotFeatures(ctx.spotFeatures, shinesWhenDataFrom(surfData)).map(f => pickExample(f.examples)),
       timing_advice: getFallbackTimingAdvice(surfData.details.tide_state, viability)
     },
     cached_until: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
@@ -574,7 +628,12 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
   const waveDesc = waveSizeOf(surfData).descriptor
   const swellCompass = surfData.details.swell_direction_compass || 'unknown direction'
   const windCompass = surfData.details.wind_direction_compass || 'variable'
-  const primarySpot = (ctx.spotFeatures[0] ? pickExample(ctx.spotFeatures[0].examples) : undefined) || ctx.locationName
+
+  // Only name a spot when today's real data actually earns it (matches its
+  // shinesWhenConditions, or it's unconditional) — guessing by array position is exactly
+  // the dishonest "overconfident beach pick" this mechanism replaces.
+  const earned = pickEarnedSpotFeatures(ctx.spotFeatures, shinesWhenDataFrom(surfData))
+  const primarySpot = earned[0] ? pickExample(earned[0].examples) : undefined
 
   const paragraph1 = `${ctx.locationName} surf check shows ${waveDesc} waves at ${surfData.details.wave_period_sec} seconds coming from the ${swellCompass}, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some nice long rides' : 'quicker, choppier waves with less power'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean, glassy conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} at ${surfData.details.tide_height_ft}ft and water temp is ${surfData.weather.water_temperature_f}°F.`
 
@@ -590,7 +649,9 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
     : condition === 'fair' ? 'Surfable if you need your wave fix.'
     : 'Might be better for a beach walk, but conditions can change quickly.'
 
-  return `${paragraph1}\n\n${primarySpot} is worth checking. ${tideNote}. ${verdict}`
+  const spotNote = primarySpot ? `${primarySpot} is worth checking.` : `No single spot clearly stands out today — worth checking a few stretches.`
+
+  return `${paragraph1}\n\n${spotNote} ${tideNote}. ${verdict}`
 }
 
 async function handleRequest(req: Request): Promise<Response> {
