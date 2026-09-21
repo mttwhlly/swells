@@ -1,10 +1,20 @@
 name: Refit Wave Calibrations
 
-# The per-location waveHeightCalibration factors in src/app/lib/locations.ts correct a
-# systematic bias in Open-Meteo's modelled wave height. They were fitted on a single
-# late-summer window and are expected to drift, so this runs the refit quarterly and
-# opens an issue with the results. It never edits locations.ts — applying a new factor
-# is a deliberate manual change.
+# Quarterly MONITOR for the per-location waveHeightCalibration factors in
+# src/app/lib/locations.ts.
+#
+# This is deliberately not a refit trigger. The two-year study in scripts/
+# calibration-seasonality.ts showed the factors drift only 3-7% year over year, so
+# re-deriving them quarterly would chase noise. What this catches instead is the stuff
+# that breaks without warning: a decommissioned buoy, a station that stopped reporting
+# WVHT, or a genuine regime change at one site.
+#
+# Note the tool it runs works on a <=45 day window, which is too short to *set* a factor
+# — a short window encodes whichever season it lands in, which is exactly how the
+# previous generation of factors ended up wrong. Replacement values come from
+# `pnpm calibration-seasonality --recommend` over full years. The issue body says so.
+#
+# It never edits locations.ts.
 
 on:
   schedule:
@@ -57,8 +67,12 @@ jobs:
           QUARTER="Q$(( ($(date -u +%-m) - 1) / 3 + 1 )) $(date -u +%Y)"
 
           {
-            echo "The wave height calibration factors in \`src/app/lib/locations.ts\` are"
-            echo "fitted on a single seasonal window and drift. This is the ${QUARTER} refit."
+            echo "Quarterly health check on the wave height calibration factors in"
+            echo "\`src/app/lib/locations.ts\`. This is ${QUARTER}."
+            echo ""
+            echo "**This is a monitor, not a refit.** The factors drift only 3-7% year over"
+            echo "year, so a flag here usually means something broke — a dead buoy, a station"
+            echo "that stopped reporting \`WVHT\` — rather than that a factor needs updating."
             echo ""
 
             if [ "$EXIT_CODE" != "0" ]; then
@@ -73,13 +87,21 @@ jobs:
             echo ""
             echo "## What to do"
             echo ""
-            echo "1. Re-run locally to confirm: \`pnpm refit-calibration\`"
-            echo "2. For each location flagged \`* drifted\`, sanity-check the buoy is alive and"
-            echo "   the window isn't dominated by one storm (try \`--days 45\` to compare)."
-            echo "3. Apply only factors that beat no correction out-of-sample. Pin the rest to \`1.00\`."
-            echo "4. Update \`waveHeightCalibration\`, \`calibrationFittedOn\`, and the fit comment together."
-            echo "5. Re-run \`pnpm test\` — the wave-size golden tables should be unaffected, but the"
-            echo "   surfability tests exercise the calibration path."
+            echo "**If a location errored** (dead or silent buoy) that is the real finding."
+            echo "Pick a replacement station and update \`calibrationBuoyId\`."
+            echo ""
+            echo "**If a location is flagged \`* drifted\`**, do not paste the suggested number."
+            echo "This tool fits on a \`<=45\` day window, which encodes whichever season it lands"
+            echo "in — that is exactly how the previous factors ended up wrong. Instead:"
+            echo ""
+            echo "1. \`pnpm calibration-seasonality --location <slug> --validate --recommend\`"
+            echo "2. Compare schemes out of sample. Apply a factor only if it beats no"
+            echo "   correction; pin it to \`1.00\` if it does not."
+            echo "3. Update \`waveHeightCalibration\`, \`calibrationFittedOn\`, \`calibrationWindow\`"
+            echo "   and the fit comment together."
+            echo "4. Re-run \`pnpm test\`."
+            echo ""
+            echo "**Nothing flagged and no errors?** Close this issue."
             echo ""
             echo "Background: the \"Wave height calibration\" section of \`CLAUDE.md\`."
             echo ""

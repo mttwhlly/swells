@@ -149,12 +149,16 @@ describe('per-location wave height calibration', () => {
     expect(body.details.wave_height_ft).toBeCloseTo(Math.round(expectedFt * 10) / 10, 1);
   });
 
-  it('leaves height unchanged where the model is already unbiased', async () => {
-    const maine = getLocation('higgins-beach')!;
-    expect(maine.waveHeightCalibration).toBe(1);
-    stubUpstream({ swellDirection: 135, windDirection: 315, waveHeightM: 1.0 });
+  // Huntington is the one location left uncorrected: over 2024-2025 it fits to 1.01 and
+  // the factor changes out-of-sample RMSE by nothing at all. (Higgins used to play this
+  // role, on a September window that made it look unbiased. Two full years showed it
+  // running ~13% low in every month, so it now carries a real factor.)
+  it('leaves height unchanged where the model has no annual bias', async () => {
+    const socal = getLocation('huntington-beach')!;
+    expect(socal.waveHeightCalibration).toBe(1);
+    stubUpstream({ swellDirection: 225, windDirection: 45, waveHeightM: 1.0 });
 
-    const body = await getReport('higgins-beach');
+    const body = await getReport('huntington-beach');
 
     expect(body.details.wave_height_ft).toBeCloseTo(3.3, 1);
   });
@@ -168,6 +172,22 @@ describe('per-location wave height calibration', () => {
         expect(loc.calibrationBuoyId).toBeTruthy();
         expect(loc.calibrationFittedOn).toBeTruthy();
       }
+    }
+  });
+
+  // The previous factors were each fitted on one ~30-day September window, which encoded
+  // the late-summer trough as a year-round constant and left four locations materially
+  // wrong — Oahu's was worse than applying no correction at all. The window a factor was
+  // fitted over is the thing that makes it trustworthy, so it has to be recorded.
+  it('records the fitting window for every calibrated location', () => {
+    for (const loc of LOCATIONS) {
+      if (loc.calibrationBuoyId === null) continue;
+      expect(loc.calibrationWindow).toBeTruthy();
+      // Two distinct calendar years, so seasonal swing is averaged out and
+      // year-over-year repeatability is actually observable.
+      expect(loc.calibrationWindow).toMatch(/^\d{4}-\d{4}$/);
+      const [from, to] = loc.calibrationWindow!.split('-').map(Number);
+      expect(to).toBeGreaterThan(from);
     }
   });
 });
