@@ -6,6 +6,13 @@ import { describeWaveSize } from '@/lib/waveSize';
 
 export const dynamic = 'force-dynamic';
 
+// Several examples per archetype are often genuinely interchangeable — pick one at
+// random rather than always using examples[0], so the fallback template doesn't
+// repeatedly name the same beach just because it's listed first.
+function pickExample(examples: string[]): string {
+  return examples[Math.floor(Math.random() * examples.length)] ?? examples[0]!;
+}
+
 // Shape of the JSON returned by GET /api/surfability — the only fields this route reads.
 interface SurfabilityData {
   location: string;
@@ -193,7 +200,7 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
           },
           localKnowledge: location.localKnowledge,
           voiceDescriptor: location.voiceDescriptor,
-          bestSpots: location.bestSpots,
+          spotFeatures: location.spotFeatures,
           locationName: location.name,
           lat: location.lat,
           lon: location.lon,
@@ -240,7 +247,7 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
           board_type: waveSizeFor(surfData).face_height_ft >= 4 ? 'Shortboard' : 'Longboard',
           wetsuit_thickness: surfData.weather.water_temperature_f < 65 ? '3/2mm' : surfData.weather.water_temperature_f < 72 ? 'Spring suit' : undefined,
           skill_level: surfData.score >= 65 ? 'intermediate' : 'beginner',
-          best_spots: location.bestSpots,
+          best_spots: location.spotFeatures.map(f => pickExample(f.examples)),
           timing_advice: 'Check conditions regularly as they change throughout the day'
         },
         cached_until: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
@@ -304,8 +311,8 @@ function createDetailedFallbackReport(surfData: SurfabilityData, windMph: number
   const size = waveSizeFor(surfData);
   const swellCompass = surfData.details.swell_direction_compass || 'unknown direction';
   const windCompass = surfData.details.wind_direction_compass || 'variable';
-  const primarySpot = location.bestSpots[0] || location.name;
-  const secondarySpot = location.bestSpots[1] || location.name;
+  const primarySpot = (location.spotFeatures[0] ? pickExample(location.spotFeatures[0].examples) : undefined) || location.name;
+  const secondarySpot = (location.spotFeatures[1] ? pickExample(location.spotFeatures[1].examples) : undefined) || location.name;
 
   const paragraph1 = `${location.name} surf check shows ${size.size_descriptor} waves at ${surfData.details.wave_period_sec} seconds from ${swellCompass} direction, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some long rides' : 'quicker, choppier waves with less push'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} and water temp is ${surfData.weather.water_temperature_f}°F.`;
 
