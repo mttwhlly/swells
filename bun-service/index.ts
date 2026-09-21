@@ -12,7 +12,7 @@ const surfReportSchema = z.object({
     boardType: z.string().describe("General board type recommendation (longboard, shortboard, funboard) - NO specific sizes"),
     wetsuitThickness: z.string().optional().describe("Wetsuit recommendation"),
     skillLevel: z.enum(['beginner', 'intermediate', 'advanced']).describe("Recommended skill level"),
-    bestSpots: z.array(z.string()).min(2).describe("Top 2-3 spot recommendations for this location"),
+    bestSpots: z.array(z.string()).describe("The example spot(s) actually named in paragraph 2, reflecting the geographic setup that matches today's conditions. Empty if paragraph 2 said the options are comparable today rather than naming one."),
     timingAdvice: z.string().describe("When to surf — or when to check back if conditions are not currently viable. Must stay within the prompt's Daylight Window (never recommend surfing, or waiting for a tide change, after sunset or before sunrise).")
   })
 })
@@ -25,11 +25,17 @@ const surfReportSchema = z.object({
 // in the prompt. A tier that fails validation is treated the same as a thrown error —
 // the caller moves on to the next model, then to the deterministic template.
 export interface ReportValidationIssue {
-  code: 'banned_opener' | 'word_count' | 'wind_contradiction'
+  code: 'banned_opener' | 'word_count' | 'wind_contradiction' | 'fabricated_crowd_count'
   detail: string
 }
 
 const BANNED_OPENERS = [/^right now,?\s+we'?re looking at/i, /^we'?re looking at/i]
+
+// There is no data source anywhere in the pipeline for who is actually in the water —
+// /api/surfability has no webcam or crowd sensor. Catches the model inventing a headcount
+// or specific-people claim (e.g. "maybe a dozen heads out at Vilano") when the "crowd/vibe"
+// opening angle gets picked with nothing real to describe.
+const CROWD_COUNT_PATTERN = /\b(?:a\s+)?(?:handful|dozen|couple|few|bunch)\s+of\s+(?:surfers|guys|people|heads)\b|\b\d+\s+(?:surfers|guys|people|heads)\b|\bheads?\s+(?:out|in the water)\b|\b(?:empty|crowded|packed)\s+lineup\b/i
 
 export function validateReportText(paragraphs: string[], windDescription: string | null): ReportValidationIssue[] {
   const issues: ReportValidationIssue[] = []
@@ -59,6 +65,11 @@ export function validateReportText(paragraphs: string[], windDescription: string
     if (groundTruthOnshore && mentionsOffshore && !mentionsOnshore) {
       issues.push({ code: 'wind_contradiction', detail: `Ground truth says onshore ("${windDescription}") but report calls the wind offshore` })
     }
+  }
+
+  const crowdMatch = combined.match(CROWD_COUNT_PATTERN)
+  if (crowdMatch) {
+    issues.push({ code: 'fabricated_crowd_count', detail: `Report claims a crowd/headcount with no data to back it ("${crowdMatch[0]}")` })
   }
 
   return issues
@@ -251,11 +262,80 @@ function getFallbackTimingAdvice(tideState: string, viability: SessionViability)
   return 'Mid to outgoing tide usually favours the local breaks — check tide charts for timing'
 }
 
+// Mirrors SpotFeature/SpotShinesCondition/ShinesWhenData/pickEarnedSpotFeatures in
+// src/app/lib/locations.ts — this service deploys separately and can't import from
+// src/, so it carries its own copy of the shape and the matching logic (not the data,
+// which arrives per-request from the Next.js app; eval/harness.ts carries its own copy
+// of the data for its hardcoded scenarios).
+export interface SpotFeature {
+  archetype: string;
+  examples: string[];
+  shinesWhen: string;
+  shinesWhenConditions?: SpotShinesCondition[];
+}
+
+export interface SpotShinesCondition {
+  swellFrom?: string[];
+  minWaveHeightFt?: number;
+  maxWaveHeightFt?: number;
+  minPeriodSec?: number;
+  maxPeriodSec?: number;
+  tideIncludes?: string[];
+  wind?: 'onshore' | 'offshore';
+}
+
+export interface ShinesWhenData {
+  swellDirectionCompass: string;
+  windDirectionDescription: string;
+  waveHeightFt: number;
+  wavePeriodSec: number;
+  tideState: string;
+}
+
+function matchesCondition(condition: SpotShinesCondition, data: ShinesWhenData): boolean {
+  if (condition.swellFrom && !condition.swellFrom.includes(data.swellDirectionCompass)) return false
+  if (condition.minWaveHeightFt !== undefined && data.waveHeightFt < condition.minWaveHeightFt) return false
+  if (condition.maxWaveHeightFt !== undefined && data.waveHeightFt > condition.maxWaveHeightFt) return false
+  if (condition.minPeriodSec !== undefined && data.wavePeriodSec < condition.minPeriodSec) return false
+  if (condition.maxPeriodSec !== undefined && data.wavePeriodSec > condition.maxPeriodSec) return false
+  if (condition.tideIncludes && !condition.tideIncludes.some(t => data.tideState.includes(t))) return false
+  if (condition.wind && !data.windDirectionDescription.toLowerCase().includes(condition.wind)) return false
+  return true
+}
+
+// Which spotFeatures are genuinely earned by today's real data, for the deterministic
+// (non-AI) fallback report. An archetype with no shinesWhenConditions is always
+// eligible; one with conditions is eligible only when at least one OR'd group matches.
+// Can return an empty array — the honest answer when nothing is earned is to name no
+// spot, not to guess one by array position.
+export function pickEarnedSpotFeatures(spotFeatures: SpotFeature[], data: ShinesWhenData): SpotFeature[] {
+  return spotFeatures.filter(f =>
+    !f.shinesWhenConditions?.length || f.shinesWhenConditions.some(c => matchesCondition(c, data))
+  )
+}
+
+// Several examples per archetype are often genuinely interchangeable — pick one at
+// random per call (like pickOpeningAngle below) rather than always showing examples[0],
+// so the report doesn't repeatedly name the same beach just because it's listed first.
+function pickExample(examples: string[]): string {
+  return examples[Math.floor(Math.random() * examples.length)] ?? examples[0]!
+}
+
+function shinesWhenDataFrom(surfData: any): ShinesWhenData {
+  return {
+    swellDirectionCompass: surfData.details.swell_direction_compass,
+    windDirectionDescription: surfData.details.wind_direction_description,
+    waveHeightFt: surfData.details.wave_height_ft,
+    wavePeriodSec: surfData.details.wave_period_sec,
+    tideState: surfData.details.tide_state,
+  }
+}
+
 export interface LocationContext {
   locationName: string;
   localKnowledge: string;
   voiceDescriptor: string;
-  bestSpots: string[];
+  spotFeatures: SpotFeature[];
   lat: number;
   lon: number;
   timezone: string;
@@ -267,7 +347,7 @@ export interface LocationContext {
 const OPENING_ANGLES = [
   'Lead with the verdict — worth paddling out or not — then explain why. Save the conditions breakdown for after.',
   'Lead with what today demands from a surfer (board choice, positioning, patience) rather than a conditions recap.',
-  'Lead with the crowd and vibe you would find in the water right now, then work back to the conditions driving it.',
+  'Lead with the overall vibe the conditions set — loose, punchy, sloppy, whatever fits — then work back to what is driving it. Do not claim a headcount or describe specific people in the water; you have no data on who is actually out there.',
   'Lead by naming the specific spot that matters most today and what is actually happening there.',
   'Lead with a direct, second-person line about what paddling out would feel like in the first few minutes.',
   'Lead with how today compares to what this spot normally does, using your local knowledge — not a plain conditions list.',
@@ -340,8 +420,8 @@ It is currently nighttime. Nobody surfs in the dark.
 LOCAL KNOWLEDGE FOR THIS SPOT:
 ${ctx.localKnowledge}
 
-RECOMMENDED SPOTS:
-${ctx.bestSpots.join(', ')}
+GEOGRAPHIC SETUPS AT THIS LOCATION:
+${ctx.spotFeatures.map(f => `• ${f.archetype} (e.g. ${pickExample(f.examples)}) — shines when: ${f.shinesWhen}`).join('\n')}
 
 CURRENT CONDITIONS (raw data — reference in your own words, see NOTE below on the two hint lines):
 • Surf Size: ${waveSize.descriptor} (this is the size to describe to the reader)
@@ -364,6 +444,7 @@ NOTE: Do not restate raw figures verbatim in prose (wave height, period, tempera
 NOTE ON SIZE: Describe the surf using the body scale given in Surf Size ("waist to chest high", "overhead", and so on), or your own natural equivalent. Do NOT give the size as a number of feet. Forecast models measure significant wave height offshore, which is a smaller number than the face of the wave a surfer actually rides, so quoting feet here would understate the surf and mislead the reader. The body-scale label already accounts for that difference.
 NOTE: The "Wave Quality" and "Tide Context" lines above are internal hints describing what the numbers mean, not sentences to paraphrase or echo. Reach your own conclusion about the surf in your own words — do not restate their wording or sentence shape.
 NOTE: Do not state any date, day-of-week, season, or "time of year" framing, and do not claim conditions are typical/atypical for the season — unless it is directly supported by the data given above. If you reference the day or date, it must match Local Date exactly.
+NOTE: You have no data on who is in the water. Never state or imply a headcount ("a dozen heads out", "a few guys", "empty lineup") or describe specific surfers — you cannot observe this and would be inventing it.
 
 AVOID GENERIC OPENERS: Never start with "Right now we're looking at", "We're looking at", "Right now, we're looking at", or any close variant of that phrasing — it's the default surf-report cliché and every report should not sound the same.
 AVOID STOCK PHRASES: Don't reach for worn-out crutches like "bathwater warm", "honestly", "real talk", "quick and choppy", "worth the paddle out", "get your feet wet", "is your best bet" — find your own words each time, specific to today's conditions.
@@ -375,7 +456,9 @@ WRITE 2 SHORT PARAGRAPHS, totaling roughly 100-160 words (not padded to hit that
 Open using THIS CALL'S ANGLE above. Synthesise what the wave height, period, swell direction, and wind actually mean for surf quality at this specific spot — the character of the waves, whether they'll have power or be mushy. For the onshore/offshore effect, use the Wind Effect ground-truth label given above verbatim in meaning (do not re-derive it from the raw wind compass direction or from local-knowledge phrases like "offshore on X winds" — those describe a different location's or spot's typical pattern and can mislead you on today's actual angle). Use your local knowledge of this break to make it specific and accurate otherwise. Mention the tide and water temp only if they actually change what the surfer should expect today — skip them if they're unremarkable.
 
 **Paragraph 2 - Verdict & Move** (~50-80 words):
-Move forward, don't repeat — the reader already has paragraph 1's conditions read, so don't re-explain it in different words. Give ONE clear recommendation: name the single best spot for today's conditions and why, in a phrase — not a ranked rundown of every spot on the list. Mention the crowd or vibe only if it changes the call. Close with the honest bottom line — worth paddling out or not — and a timing window if one actually matters.
+Move forward, don't repeat — the reader already has paragraph 1's conditions read, so don't re-explain it in different words. If THIS CALL'S ANGLE already did paragraph 2's usual job inside paragraph 1 (it already gave the verdict, or already named a spot), do not say that again here — pivot to genuinely new ground instead: a practical detail paragraph 1 didn't cover, like positioning, gear, timing specifics, or what would change the call.
+
+For where to go: weigh today's actual wind/swell/tide/size against the GEOGRAPHIC SETUPS above. Recommend ONE setup — named via its example spot — only when today's conditions genuinely match its "shines when" condition, and hedge it like a suggestion, not a verdict: "maybe try a channel setup like X, it tends to hold up in conditions like today's" rather than "head to X." The named spot is one illustration of that setup, not the only correct answer — don't imply it's uniquely superior to every other beach nearby. If today's conditions don't clearly favor one setup over the others, say so honestly — a few options would work about the same today — rather than forcing a confident pick you can't actually back up. Mention overall vibe only if it changes the call — never a headcount or description of specific people in the water; you have no data on who is actually out there. Close with the honest bottom line — worth paddling out or not — and a timing window if one actually matters.
 When you name a "best window" or point to a future tide change (next high/low), only ever recommend a time inside the Daylight Window above — never suggest waiting for a tide, or paddling out, after sunset or before sunrise. If the next favorable tide falls outside daylight hours, say plainly that today's window is what's in front of you right now (or already closed for the day) rather than pointing the reader at an after-dark tide change as if it were a real option.
 
 TONE: ${ctx.voiceDescriptor}. Use some surf slang but keep it readable.`
@@ -506,7 +589,7 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
         : surfData.weather.water_temperature_f < 72 ? 'Spring suit'
         : undefined,
       skill_level: surfData.score >= 65 ? 'intermediate' : 'beginner',
-      best_spots: ctx.bestSpots,
+      best_spots: pickEarnedSpotFeatures(ctx.spotFeatures, shinesWhenDataFrom(surfData)).map(f => pickExample(f.examples)),
       timing_advice: getFallbackTimingAdvice(surfData.details.tide_state, viability)
     },
     cached_until: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
@@ -545,7 +628,12 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
   const waveDesc = waveSizeOf(surfData).descriptor
   const swellCompass = surfData.details.swell_direction_compass || 'unknown direction'
   const windCompass = surfData.details.wind_direction_compass || 'variable'
-  const primarySpot = ctx.bestSpots[0] || ctx.locationName
+
+  // Only name a spot when today's real data actually earns it (matches its
+  // shinesWhenConditions, or it's unconditional) — guessing by array position is exactly
+  // the dishonest "overconfident beach pick" this mechanism replaces.
+  const earned = pickEarnedSpotFeatures(ctx.spotFeatures, shinesWhenDataFrom(surfData))
+  const primarySpot = earned[0] ? pickExample(earned[0].examples) : undefined
 
   const paragraph1 = `${ctx.locationName} surf check shows ${waveDesc} waves at ${surfData.details.wave_period_sec} seconds coming from the ${swellCompass}, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some nice long rides' : 'quicker, choppier waves with less power'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean, glassy conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} at ${surfData.details.tide_height_ft}ft and water temp is ${surfData.weather.water_temperature_f}°F.`
 
@@ -561,7 +649,9 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
     : condition === 'fair' ? 'Surfable if you need your wave fix.'
     : 'Might be better for a beach walk, but conditions can change quickly.'
 
-  return `${paragraph1}\n\n${primarySpot} is worth checking. ${tideNote}. ${verdict}`
+  const spotNote = primarySpot ? `${primarySpot} is worth checking.` : `No single spot clearly stands out today — worth checking a few stretches.`
+
+  return `${paragraph1}\n\n${spotNote} ${tideNote}. ${verdict}`
 }
 
 async function handleRequest(req: Request): Promise<Response> {
@@ -586,7 +676,7 @@ async function handleRequest(req: Request): Promise<Response> {
   if (method === 'POST' && url.pathname === '/generate-surf-report') {
     try {
       const body = await req.json()
-      const { surfData, apiKey, localKnowledge, voiceDescriptor, bestSpots, locationName, lat, lon, timezone } = body
+      const { surfData, apiKey, localKnowledge, voiceDescriptor, spotFeatures, locationName, lat, lon, timezone } = body
 
       if (apiKey !== process.env.API_SECRET) {
         return jsonResponse({ error: 'Unauthorized' }, 401)
@@ -599,7 +689,7 @@ async function handleRequest(req: Request): Promise<Response> {
         locationName: locationName ?? surfData.location ?? 'Unknown',
         localKnowledge: localKnowledge ?? '',
         voiceDescriptor: voiceDescriptor ?? 'experienced surf forecaster',
-        bestSpots: bestSpots ?? [],
+        spotFeatures: spotFeatures ?? [],
         lat: lat ?? 30,
         lon: lon ?? -81,
         timezone: timezone ?? 'America/New_York',
@@ -628,7 +718,7 @@ async function handleRequest(req: Request): Promise<Response> {
       const body = await req.json()
       const {
         cronSecret, vercelUrl,
-        locationSlug, locationName, localKnowledge, voiceDescriptor, bestSpots, lat, lon, timezone
+        locationSlug, locationName, localKnowledge, voiceDescriptor, spotFeatures, lat, lon, timezone
       } = body
 
       if (cronSecret !== process.env.CRON_SECRET) {
@@ -640,7 +730,7 @@ async function handleRequest(req: Request): Promise<Response> {
         locationName: locationName ?? slug,
         localKnowledge: localKnowledge ?? '',
         voiceDescriptor: voiceDescriptor ?? 'experienced surf forecaster',
-        bestSpots: bestSpots ?? [],
+        spotFeatures: spotFeatures ?? [],
         lat: lat ?? 30,
         lon: lon ?? -81,
         timezone: timezone ?? 'America/New_York',

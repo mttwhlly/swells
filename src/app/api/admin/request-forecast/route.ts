@@ -72,7 +72,7 @@ export async function GET(request: NextRequest) {
             locationName: location.name,
             localKnowledge: location.localKnowledge,
             voiceDescriptor: location.voiceDescriptor,
-            bestSpots: location.bestSpots,
+            spotFeatures: location.spotFeatures,
             lat: location.lat,
             lon: location.lon,
             timezone: location.timezone,
