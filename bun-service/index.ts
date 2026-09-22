@@ -25,7 +25,7 @@ const surfReportSchema = z.object({
 // in the prompt. A tier that fails validation is treated the same as a thrown error —
 // the caller moves on to the next model, then to the deterministic template.
 export interface ReportValidationIssue {
-  code: 'banned_opener' | 'word_count' | 'wind_contradiction' | 'fabricated_crowd_count'
+  code: 'banned_opener' | 'word_count' | 'wind_contradiction' | 'fabricated_crowd_count' | 'stock_phrase'
   detail: string
 }
 
@@ -36,6 +36,43 @@ const BANNED_OPENERS = [/^right now,?\s+we'?re looking at/i, /^we'?re looking at
 // or specific-people claim (e.g. "maybe a dozen heads out at Vilano") when the "crowd/vibe"
 // opening angle gets picked with nothing real to describe.
 const CROWD_COUNT_PATTERN = /\b(?:a\s+)?(?:handful|dozen|couple|few|bunch)\s+of\s+(?:surfers|guys|people|heads)\b|\b\d+\s+(?:surfers|guys|people|heads)\b|\bheads?\s+(?:out|in the water)\b|\b(?:empty|crowded|packed)\s+lineup\b/i
+
+// Worn-out surf-report crutches. Single source of truth: the AVOID STOCK PHRASES line in
+// createDetailedSurfPrompt is generated from STOCK_PHRASES, so the list the model is told
+// to avoid and the list we measure against can't drift apart.
+//
+// Split into two tiers because measured incidence differs by an order of magnitude.
+// Across 30 eval reports, the prompt instruction alone was ~0% effective: 4-5 of every 10
+// reports still contained a banned phrase. But "honestly" accounted for the large majority
+// of hits on its own — it's an ordinary adverb, not a surf cliche like "bathwater warm" —
+// so rejecting on it would bounce ~45% of Haiku output into the gpt-4o-mini retry (which
+// also uses it), risking fallthrough to the deterministic template. The distinctive
+// phrases sit at ~13% incidence, which the retry ladder absorbs comfortably.
+export const GATED_STOCK_PHRASES = [
+  'bathwater warm',
+  'real talk',
+  'quick and choppy',
+  'worth the paddle out',
+  'get your feet wet',
+  'is your best bet',
+] as const
+
+// Monitored by the eval harness only — never a rejection reason.
+const MONITORED_STOCK_PHRASES = ['honestly'] as const
+
+export const STOCK_PHRASES = [...GATED_STOCK_PHRASES, ...MONITORED_STOCK_PHRASES] as const
+
+const patternsFor = (phrases: readonly string[]) => phrases.map(p =>
+  new RegExp(`\\b${p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi')
+)
+
+const GATED_STOCK_PATTERNS = patternsFor(GATED_STOCK_PHRASES)
+const ALL_STOCK_PATTERNS = patternsFor(STOCK_PHRASES)
+
+// Every banned phrase, gated or merely monitored — the eval harness's compliance metric.
+export function findStockPhrases(text: string): string[] {
+  return ALL_STOCK_PATTERNS.flatMap(re => text.match(re) ?? [])
+}
 
 export function validateReportText(paragraphs: string[], windDescription: string | null): ReportValidationIssue[] {
   const issues: ReportValidationIssue[] = []
@@ -65,6 +102,16 @@ export function validateReportText(paragraphs: string[], windDescription: string
     if (groundTruthOnshore && mentionsOffshore && !mentionsOnshore) {
       issues.push({ code: 'wind_contradiction', detail: `Ground truth says onshore ("${windDescription}") but report calls the wind offshore` })
     }
+  }
+
+  // The prompt asks for these to be avoided and is measurably ignored — enforcing here
+  // is what actually removes them, the same way CROWD_COUNT_PATTERN backs the crowd rule.
+  const stockMatches = GATED_STOCK_PATTERNS.flatMap(re => combined.match(re) ?? [])
+  if (stockMatches.length > 0) {
+    issues.push({
+      code: 'stock_phrase',
+      detail: `Report leans on stock surf-report phrasing (${stockMatches.map(m => `"${m}"`).join(', ')})`,
+    })
   }
 
   const crowdMatch = combined.match(CROWD_COUNT_PATTERN)
@@ -180,10 +227,14 @@ function getCompassDirection(degrees: number): string {
   return directions[index]
 }
 
+// Feeds the prompt's "Wave Quality (hint)" line, so none of these may contain a phrase
+// from GATED_STOCK_PHRASES — handing the model a banned phrase and then rejecting it for
+// echoing it is a trap of our own making. ("quick and choppy" used to live on line 3 and
+// was the single most-rejected phrase in eval runs as a direct result.)
 function getWaveQuality(height: number, period: number): string {
   if (period >= 12) return 'Quality groundswell with good power and long rides.'
   if (period >= 8) return 'Decent swell with moderate power and rideable waves.'
-  if (period >= 6) return 'Short period wind swell — waves will be quick and choppy.'
+  if (period >= 6) return 'Short period wind swell — little organisation between sets.'
   return 'Very short period — expect weak, mushy waves.'
 }
 
@@ -347,7 +398,7 @@ export interface LocationContext {
 const OPENING_ANGLES = [
   'Lead with the verdict — worth paddling out or not — then explain why. Save the conditions breakdown for after.',
   'Lead with what today demands from a surfer (board choice, positioning, patience) rather than a conditions recap.',
-  'Lead with the overall vibe the conditions set — loose, punchy, sloppy, whatever fits — then work back to what is driving it. Do not claim a headcount or describe specific people in the water; you have no data on who is actually out there.',
+  'Lead with the overall vibe the conditions set — loose, punchy, sloppy, whatever fits — then work back to what is driving it.',
   'Lead by naming the specific spot that matters most today and what is actually happening there.',
   'Lead with a direct, second-person line about what paddling out would feel like in the first few minutes.',
   'Lead with how today compares to what this spot normally does, using your local knowledge — not a plain conditions list.',
@@ -357,6 +408,28 @@ const OPENING_ANGLES = [
 
 function pickOpeningAngle(): string {
   return OPENING_ANGLES[Math.floor(Math.random() * OPENING_ANGLES.length)]!
+}
+
+// OPENING_ANGLES rotates the first sentence and demonstrably works — across 179 eval
+// reports no opening recurred more than 13 times. The body then reconverged anyway: the
+// six most common beat orders all ended "... tide -> water temp -> verdict", and a third
+// of all reports used some "tide is (working) in your favor" frame, at the same rate on
+// genuinely different conditions as on identical ones. The cause was paragraph 1's own
+// spec, which enumerated the factors to cover and so prescribed the order to cover them
+// in. These rotate the SHAPE of the body the way OPENING_ANGLES rotates its first line.
+const REPORT_SHAPES = [
+  'Cover the factors in descending order of how much they matter today, and stop once you run out of ones that genuinely matter. Do not sweep every factor for completeness.',
+  'Pick the two factors doing the most work today and go deep on those two alone. Leave the others out entirely.',
+  'Build the paragraph around a single contrast — what is working set against what is not — rather than a survey of conditions.',
+  'Describe it as a sequence in time: what the first ten minutes in the water feel like, then what shifts as the tide moves.',
+  'Anchor everything to one comparison — how today measures up against what this spot normally does — and raise a factor only where it explains the gap.',
+  'Lead with the limiting factor, the single thing capping how good today gets, and treat every other detail as subordinate to it.',
+  'Skip the conditions survey almost entirely: describe what kind of session is on offer and what a surfer would have to do to get the most out of it.',
+  'Work outward from the water itself — what the waves are actually doing as they break — and bring in wind, tide or temperature only where they explain what you just described.',
+]
+
+function pickReportShape(): string {
+  return REPORT_SHAPES[Math.floor(Math.random() * REPORT_SHAPES.length)]!
 }
 
 export function createDetailedSurfPrompt(surfData: any, ctx: LocationContext, now: Date = new Date()): string {
@@ -449,18 +522,20 @@ NOTE: You have no data on who is in the water. Never state or imply a headcount 
 NOTE: LOCAL KNOWLEDGE opens with this spot's cardinal orientation (e.g. "East-facing beach break") so you can reason about which swell and wind directions work here — don't restate it as if it were a detail worth telling the reader ("for this east-facing beach"). It's implied by the location; only surface it if today's specific swell or wind angle relative to that orientation is unusual enough to be worth flagging.
 
 AVOID GENERIC OPENERS: Never start with "Right now we're looking at", "We're looking at", "Right now, we're looking at", or any close variant of that phrasing — it's the default surf-report cliché and every report should not sound the same.
-AVOID STOCK PHRASES: Don't reach for worn-out crutches like "bathwater warm", "honestly", "real talk", "quick and choppy", "worth the paddle out", "get your feet wet", "is your best bet" — find your own words each time, specific to today's conditions.
+AVOID STOCK PHRASES: Don't reach for worn-out crutches like ${STOCK_PHRASES.map(p => `"${p}"`).join(', ')} — find your own words each time, specific to today's conditions.
 THIS CALL'S ANGLE: ${pickOpeningAngle()}
 
 WRITE 2 SHORT PARAGRAPHS, totaling roughly 100-160 words (not padded to hit that number — shorter is fine if the conditions don't need more words to describe; vary sentence count and length naturally). This report renders in large type on a phone screen, so every sentence has to earn its place — cut anything that only restates or decorates a point you've already made.
 
 **Paragraph 1 - Conditions Analysis** (~50-90 words):
-Open using THIS CALL'S ANGLE above. Synthesise what the wave height, period, swell direction, and wind actually mean for surf quality at this specific spot — the character of the waves, whether they'll have power or be mushy. For the onshore/offshore effect, use the Wind Effect ground-truth label given above verbatim in meaning (do not re-derive it from the raw wind compass direction or from local-knowledge phrases like "offshore on X winds" — those describe a different location's or spot's typical pattern and can mislead you on today's actual angle). Use your local knowledge of this break to make it specific and accurate otherwise. Mention the tide and water temp only if they actually change what the surfer should expect today — skip them if they're unremarkable.
+Open using THIS CALL'S ANGLE above, then organise what follows according to THIS CALL'S SHAPE below. Explain what today's conditions actually mean for surf quality at this specific spot — the character of the waves, whether they'll have power or be mushy — using your local knowledge of this break to make it specific and accurate. For the onshore/offshore effect, use the Wind Effect label given above.
+THIS CALL'S SHAPE: ${pickReportShape()}
+There is no required running order here and no checklist to complete. A factor that doesn't change what the surfer should expect today belongs out of the report entirely, not mentioned in passing — water temperature in particular is worth raising only when it changes what someone would wear.
 
 **Paragraph 2 - Verdict & Move** (~50-80 words):
 Move forward, don't repeat — the reader already has paragraph 1's conditions read, so don't re-explain it in different words. If THIS CALL'S ANGLE already did paragraph 2's usual job inside paragraph 1 (it already gave the verdict, or already named a spot), do not say that again here — pivot to genuinely new ground instead: a practical detail paragraph 1 didn't cover, like positioning, gear, timing specifics, or what would change the call.
 
-For where to go: weigh today's actual wind/swell/tide/size against the GEOGRAPHIC SETUPS above. Recommend ONE setup — named via its example spot — only when today's conditions genuinely match its "shines when" condition, and hedge it like a suggestion, not a verdict: "maybe try a channel setup like X, it tends to hold up in conditions like today's" rather than "head to X." The named spot is one illustration of that setup, not the only correct answer — don't imply it's uniquely superior to every other beach nearby. If today's conditions don't clearly favor one setup over the others, say so honestly — a few options would work about the same today — rather than forcing a confident pick you can't actually back up. Mention overall vibe only if it changes the call — never a headcount or description of specific people in the water; you have no data on who is actually out there. Close with the honest bottom line — worth paddling out or not — and a timing window if one actually matters.
+For where to go: weigh today's actual wind/swell/tide/size against the GEOGRAPHIC SETUPS above. Recommend ONE setup — named via its example spot — only when today's conditions genuinely match its "shines when" condition, and hedge it like a suggestion, not a verdict: "maybe try a channel setup like X, it tends to hold up in conditions like today's" rather than "head to X." The named spot is one illustration of that setup, not the only correct answer — don't imply it's uniquely superior to every other beach nearby. If today's conditions don't clearly favor one setup over the others, say so plainly — a few options would work about the same today — rather than forcing a confident pick you can't actually back up. Mention overall vibe only if it changes the call. Close with the honest bottom line — worth paddling out or not — and a timing window if one actually matters.
 When you name a "best window" or point to a future tide change (next high/low), only ever recommend a time inside the Daylight Window above — never suggest waiting for a tide, or paddling out, after sunset or before sunrise. If the next favorable tide falls outside daylight hours, say plainly that today's window is what's in front of you right now (or already closed for the day) rather than pointing the reader at an after-dark tide change as if it were a real option.
 
 TONE: ${ctx.voiceDescriptor}. Use some surf slang but keep it readable.`
@@ -514,10 +589,19 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
 
   for (const tier of MODEL_TIERS) {
     try {
+      // Retrying with the byte-identical prompt wastes the tier: the next model has no
+      // idea why the last one was rejected and is free to trip the same rule (observed —
+      // Haiku's "get your feet wet" was followed by gpt-4o-mini's "quick and choppy",
+      // dropping a report to the deterministic template). Feed the failure back instead.
+      const tierPrompt = lastIssues.length === 0 ? prompt : `${prompt}
+
+A PREVIOUS ATTEMPT AT THIS REPORT WAS REJECTED. Fix these specific problems, and do not reintroduce them:
+${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
+
       const { object: aiResponse } = await generateObject({
         model: tier.model,
         schema: surfReportSchema,
-        prompt,
+        prompt: tierPrompt,
         temperature: 0.6,
         maxTokens: 800,
       })
@@ -628,7 +712,10 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
   const condition = surfData.score >= 70 ? 'good' : surfData.score >= 50 ? 'fair' : 'poor'
   // Body scale, not feet — wave_height_ft is offshore Hs, not the face a surfer rides.
   const waveDesc = waveSizeOf(surfData).descriptor
-  const swellCompass = surfData.details.swell_direction_compass || 'unknown direction'
+  // Drop the clause entirely when the compass is missing rather than printing a literal
+  // "unknown direction" at the reader — an absent field is not a fact worth reporting.
+  const swellCompass = surfData.details.swell_direction_compass
+  const swellClause = swellCompass ? ` coming from the ${swellCompass}` : ''
   const windCompass = surfData.details.wind_direction_compass || 'variable'
 
   // Only name a spot when today's real data actually earns it (matches its
@@ -637,7 +724,7 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
   const earned = pickEarnedSpotFeatures(ctx.spotFeatures, shinesWhenDataFrom(surfData))
   const primarySpot = earned[0] ? pickExample(earned[0].examples) : undefined
 
-  const paragraph1 = `${ctx.locationName} surf check shows ${waveDesc} waves at ${surfData.details.wave_period_sec} seconds coming from the ${swellCompass}, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some nice long rides' : 'quicker, choppier waves with less power'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean, glassy conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} at ${surfData.details.tide_height_ft}ft and water temp is ${surfData.weather.water_temperature_f}°F.`
+  const paragraph1 = `${ctx.locationName} surf check shows ${waveDesc} waves at ${surfData.details.wave_period_sec} seconds${swellClause}, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some nice long rides' : 'quicker, choppier waves with less power'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean, glassy conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} at ${surfData.details.tide_height_ft}ft and water temp is ${surfData.weather.water_temperature_f}°F.`
 
   const tideNote = surfData.details.tide_state.includes('Rising')
     ? 'Tide is rising which often cleans things up — worth getting out sooner'
@@ -647,7 +734,9 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
     ? 'Low tide means shallower bars — check for exposed sections before paddling out'
     : 'High tide will keep things deeper and a bit mushier'
 
-  const verdict = condition === 'good' ? 'Definitely worth the paddle out today!'
+  // Avoids GATED_STOCK_PHRASES too — it would be incoherent to reject a phrase from the
+  // models and then ship it ourselves when every tier fails.
+  const verdict = condition === 'good' ? 'Definitely a day to get out there!'
     : condition === 'fair' ? 'Surfable if you need your wave fix.'
     : 'Might be better for a beach walk, but conditions can change quickly.'
 

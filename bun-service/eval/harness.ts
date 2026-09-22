@@ -10,7 +10,7 @@
 //      re-checked on every run so it can't silently regress.
 // Exits non-zero on any failure so this can run as a CI gate, not just by hand.
 
-import { generateDetailedSurfReport, validateReportText, type LocationContext } from '../index'
+import { generateDetailedSurfReport, validateReportText, findStockPhrases, type LocationContext } from '../index'
 
 interface MockConditions {
   wave_height_ft: number
@@ -228,6 +228,61 @@ function jaccardSimilarity(a: string, b: string): number {
 
 const failures: string[] = []
 
+// Prompt-compliance metric, reported but not failed on. Unlike the jaccard similarity
+// checks (which sit far below their threshold on every run and so can't resolve a
+// moderate prompt change), this one has a live baseline and real headroom, which makes
+// it the usable instrument for A/B-ing prompt edits.
+const stockPhraseHits: Array<{ label: string; hits: string[] }> = []
+
+// Every report this run, for the variety metrics below.
+const allReports: Array<{ label: string; text: string }> = []
+const fallbackLabels = new Set<string>()
+
+const normalise = (s: string) =>
+  s.toLowerCase().replace(/[^a-z0-9'\s]/g, ' ').replace(/\s+/g, ' ').trim()
+
+// Whole-report jaccard (above) can't see the kind of sameness that actually shows up in
+// this app's output: reports reuse sentence frames and a fixed beat order while carrying
+// distinct location nouns, which keeps bag-of-words overlap near 25% against a 55% line.
+// These two measure the unit the repetition actually lives in.
+//
+// 1. Shared frames — n-grams occurring in more than one report, scored by the share of
+//    reports the most common one reaches.
+// 2. Opener concentration — what share of all sentences begin with one of the ten most
+//    common opening words. Independent of the fixtures, so it stays meaningful even
+//    though most harness scenarios reuse identical conditions.
+function sharedFrames(reports: string[], n: number) {
+  const df = new Map<string, Set<number>>()
+  reports.forEach((text, idx) => {
+    const w = normalise(text).split(' ')
+    for (let i = 0; i + n <= w.length; i++) {
+      const gram = w.slice(i, i + n).join(' ')
+      if (!df.has(gram)) df.set(gram, new Set())
+      df.get(gram)!.add(idx)
+    }
+  })
+  return [...df.entries()]
+    .map(([gram, docs]) => ({ gram, docs: docs.size }))
+    .filter(x => x.docs > 1)
+    .sort((a, b) => b.docs - a.docs)
+}
+
+function openerConcentration(reports: string[]) {
+  const counts = new Map<string, number>()
+  let total = 0
+  for (const text of reports) {
+    for (const sentence of text.split(/(?<=[.!?])\s+/)) {
+      const first = normalise(sentence).split(' ')[0]
+      if (!first) continue
+      total++
+      counts.set(first, (counts.get(first) ?? 0) + 1)
+    }
+  }
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1])
+  const top10 = ranked.slice(0, 10).reduce((n, [, c]) => n + c, 0)
+  return { total, distinct: ranked.length, top10Share: total === 0 ? 0 : top10 / total, ranked }
+}
+
 async function runOne(label: string, slug: string, locationName: string, ctx: LocationContext, c: MockConditions, now: Date): Promise<string> {
   header(label)
   const surfData = mockSurfData(slug, locationName, c)
@@ -242,8 +297,20 @@ async function runOne(label: string, slug: string, locationName: string, ctx: Lo
     log(`⚠️ VALIDATION FAILED: ${issues.map(i => i.detail).join('; ')}`)
     failures.push(`${label}: ${issues.map(i => i.detail).join('; ')}`)
   }
+  const stockHits = findStockPhrases(result.report)
+  stockPhraseHits.push({ label, hits: stockHits })
+  allReports.push({ label, text: result.report })
+  if (stockHits.length > 0) {
+    log()
+    log(`📉 STOCK PHRASES: ${stockHits.map(h => `"${h}"`).join(', ')}`)
+  }
   if (result.generation_meta.backend === 'bun-fallback') {
+    fallbackLabels.add(label)
+    // The per-tier rejection reasons only reach console.warn, which the transcript never
+    // sees — without this a fallthrough is undiagnosable after the run.
+    const why = result.generation_meta.validation_issues ?? []
     log(`⚠️ Fell through to the deterministic template — every model tier failed or was rejected.`)
+    if (why.length > 0) log(`   last tier's validation issues: ${why.join('; ')}`)
     failures.push(`${label}: fell through to deterministic template (all model tiers failed or invalid)`)
   }
 
@@ -258,9 +325,16 @@ async function main() {
     const text = await runOne(`Location: ${ctx.locationName}`, slug, ctx.locationName, ctx, MEDIOCRE, DAYTIME_NOW)
     crossLocation.push({ label: ctx.locationName, text })
   }
+  // Always log the pairwise numbers, not just threshold breaches — a passing run still
+  // carries signal about whether a prompt change moved convergence, and a pass/fail-only
+  // readout can't tell "comfortably varied" from "one point under the line".
+  header('CROSS-LOCATION SIMILARITY (pairwise word overlap)')
+  const crossSims: number[] = []
   for (let i = 0; i < crossLocation.length; i++) {
     for (let j = i + 1; j < crossLocation.length; j++) {
       const sim = jaccardSimilarity(crossLocation[i]!.text, crossLocation[j]!.text)
+      crossSims.push(sim)
+      log(`  ${(sim * 100).toFixed(1)}%  ${crossLocation[i]!.label} vs ${crossLocation[j]!.label}`)
       if (sim > SIMILARITY_THRESHOLD) {
         const msg = `${crossLocation[i]!.label} vs ${crossLocation[j]!.label}: ${(sim * 100).toFixed(0)}% word overlap on identical conditions (threshold ${SIMILARITY_THRESHOLD * 100}%)`
         log(`⚠️ REPETITION: ${msg}`)
@@ -268,12 +342,16 @@ async function main() {
       }
     }
   }
+  log()
+  log(`  mean ${(crossSims.reduce((a, b) => a + b, 0) / crossSims.length * 100).toFixed(1)}%, max ${(Math.max(...crossSims) * 100).toFixed(1)}% (threshold ${SIMILARITY_THRESHOLD * 100}%)`)
 
   header('CROSS-DAY: same location, same conditions, generated twice')
   log('(Simulating two consecutive days with near-identical conditions.)')
   const day1 = await runOne('St. Augustine — "Day 1"', 'st-augustine', ST_AUGUSTINE_CTX.locationName, ST_AUGUSTINE_CTX, MEDIOCRE, DAYTIME_NOW)
   const day2 = await runOne('St. Augustine — "Day 2" (same inputs)', 'st-augustine', ST_AUGUSTINE_CTX.locationName, ST_AUGUSTINE_CTX, MEDIOCRE, DAYTIME_NOW)
   const daySim = jaccardSimilarity(day1, day2)
+  log()
+  log(`  cross-day word overlap: ${(daySim * 100).toFixed(1)}% (threshold ${SIMILARITY_THRESHOLD * 100}%)`)
   if (daySim > SIMILARITY_THRESHOLD) {
     const msg = `Day 1 vs Day 2, same location and conditions: ${(daySim * 100).toFixed(0)}% word overlap (threshold ${SIMILARITY_THRESHOLD * 100}%)`
     log(`⚠️ REPETITION: ${msg}`)
@@ -289,6 +367,43 @@ async function main() {
   log('(St. Augustine faces east — coastFacingDeg 90 — so offshore wind blows from the W/NW, not the NE.)')
   await runOne('St. Augustine — NE wind', 'st-augustine', ST_AUGUSTINE_CTX.locationName, ST_AUGUSTINE_CTX, NE_WIND_BUG_REPRO, DAYTIME_NOW)
 
+  header('VARIETY: shared sentence frames and opener concentration')
+  // Model-generated only — bun-fallback is a fixed template, so counting it here would
+  // measure the template rather than the model.
+  const modelReports = allReports.filter(r => !fallbackLabels.has(r.label)).map(r => r.text)
+  const frames7 = sharedFrames(modelReports, 7)
+  const worstFrame = frames7[0]
+  const openers = openerConcentration(modelReports)
+
+  log(`  corpus: ${modelReports.length} model-generated reports (${allReports.length - modelReports.length} fallback excluded)`)
+  log(`  distinct 7-word frames shared by 2+ reports: ${frames7.length}`)
+  if (worstFrame) {
+    log(`  most-shared frame: ${worstFrame.docs}/${modelReports.length} reports — "${worstFrame.gram}"`)
+  }
+  log(`  sentence openers: ${openers.total} sentences, ${openers.distinct} distinct first words`)
+  log(`  top-10 openers cover ${(openers.top10Share * 100).toFixed(0)}% of sentences`)
+  for (const [w, n] of openers.ranked.slice(0, 6)) {
+    log(`    ${String(n).padStart(3)}x  ${(n / openers.total * 100).toFixed(1).padStart(4)}%  "${w}"`)
+  }
+  for (const { gram, docs } of frames7.slice(0, 6)) {
+    log(`    shared by ${docs}: "${gram}"`)
+  }
+
+  header('STOCK PHRASE COMPLIANCE')
+  const totalHits = stockPhraseHits.reduce((n, r) => n + r.hits.length, 0)
+  const dirtyReports = stockPhraseHits.filter(r => r.hits.length > 0).length
+  const byPhrase = new Map<string, number>()
+  for (const r of stockPhraseHits) {
+    for (const h of r.hits) {
+      const key = h.toLowerCase()
+      byPhrase.set(key, (byPhrase.get(key) ?? 0) + 1)
+    }
+  }
+  log(`  ${dirtyReports}/${stockPhraseHits.length} reports contain a banned phrase (${totalHits} uses total)`)
+  for (const [phrase, n] of [...byPhrase.entries()].sort((a, b) => b[1] - a[1])) {
+    log(`    ${n}x  "${phrase}"`)
+  }
+
   const outPath = `eval/output/${new Date().toISOString().replace(/[:.]/g, '-')}.txt`
   await Bun.write(outPath, lines.join('\n') + '\n')
   console.log(`\nTranscript written to ${outPath}`)
@@ -299,7 +414,7 @@ async function main() {
     process.exit(1)
   }
 
-  console.log(`\nAll checks passed (${crossLocation.length + 7} reports generated).`)
+  console.log(`\nAll checks passed (${stockPhraseHits.length} reports generated).`)
 }
 
 main()
