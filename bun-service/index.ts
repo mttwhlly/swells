@@ -384,8 +384,9 @@ There is active lightning or thunderstorm activity. This overrides everything el
     : viability.isPreDawn
     ? `
 IMPORTANT — TIMING OVERRIDE:
-It is currently pre-dawn (still dark, but sunrise is only ~${viability.minutesToRise} minutes away at ${viability.riseStr}). Nobody's surfing yet, but this is NOT "the middle of the night" — do not use that phrase or imply it's late-night. Say it's early morning / not light enough yet / sunrise is close.
+It is currently pre-dawn (still dark, but sunrise is only ~${viability.minutesToRise} minutes away at ${viability.riseStr}). This is NOT "the middle of the night" — do not use that phrase or imply it's late-night. Say it's early morning / not light enough yet / sunrise is close.
 - Do NOT attempt to describe or predict tomorrow's conditions — you have no forecast data, only a current snapshot that may not reflect what daylight will bring.
+- Do not point out that nobody's in the water or nobody's surfing yet — it's self-evident that it's too dark to surf and doesn't need to be said.
 - Paragraph 1: acknowledge it's still too dark to surf but sunrise is coming soon. If the user seems curious about conditions, you may briefly describe the CURRENT snapshot (not as a prediction).
 - Paragraph 2: keep it short. Tell them conditions can be properly assessed once it's light. No guessing, no false optimism.
 - timingAdvice: mention checking back once it's light, referencing the approximate sunrise time.`
@@ -445,6 +446,7 @@ NOTE ON SIZE: Describe the surf using the body scale given in Surf Size ("waist 
 NOTE: The "Wave Quality" and "Tide Context" lines above are internal hints describing what the numbers mean, not sentences to paraphrase or echo. Reach your own conclusion about the surf in your own words — do not restate their wording or sentence shape.
 NOTE: Do not state any date, day-of-week, season, or "time of year" framing, and do not claim conditions are typical/atypical for the season — unless it is directly supported by the data given above. If you reference the day or date, it must match Local Date exactly.
 NOTE: You have no data on who is in the water. Never state or imply a headcount ("a dozen heads out", "a few guys", "empty lineup") or describe specific surfers — you cannot observe this and would be inventing it.
+NOTE: LOCAL KNOWLEDGE opens with this spot's cardinal orientation (e.g. "East-facing beach break") so you can reason about which swell and wind directions work here — don't restate it as if it were a detail worth telling the reader ("for this east-facing beach"). It's implied by the location; only surface it if today's specific swell or wind angle relative to that orientation is unusual enough to be worth flagging.
 
 AVOID GENERIC OPENERS: Never start with "Right now we're looking at", "We're looking at", "Right now, we're looking at", or any close variant of that phrasing — it's the default surf-report cliché and every report should not sound the same.
 AVOID STOCK PHRASES: Don't reach for worn-out crutches like "bathwater warm", "honestly", "real talk", "quick and choppy", "worth the paddle out", "get your feet wet", "is your best bet" — find your own words each time, specific to today's conditions.
@@ -554,7 +556,7 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
           report_length: fullReport.length,
           word_count: fullReport.split(' ').length,
           paragraphs: 2,
-          prompt_version: '3.2',
+          prompt_version: '3.3',
           validation_issues: [] as string[],
         }
       }
@@ -599,7 +601,7 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
       report_length: fallbackReport.length,
       word_count: fallbackReport.split(' ').length,
       paragraphs: 2,
-      prompt_version: '3.2',
+      prompt_version: '3.3',
       validation_issues: lastIssues.map(i => i.detail),
     }
   }
