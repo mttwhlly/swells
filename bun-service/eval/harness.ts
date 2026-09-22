@@ -352,6 +352,10 @@ async function main() {
   const daySim = jaccardSimilarity(day1, day2)
   log()
   log(`  cross-day word overlap: ${(daySim * 100).toFixed(1)}% (threshold ${SIMILARITY_THRESHOLD * 100}%)`)
+  // This pair — one spot, two consecutive reports — is the only comparison here that
+  // matches what a visitor actually sees, so it's the number to judge prose changes on.
+  // Cross-location figures inflate apparent repetition; nobody reads four spots at once.
+  log(`  cross-day shared 7-word frames: ${sharedFrames([day1, day2], 7).length} (0-1 is normal; a jump means the two reports are converging)`)
   if (daySim > SIMILARITY_THRESHOLD) {
     const msg = `Day 1 vs Day 2, same location and conditions: ${(daySim * 100).toFixed(0)}% word overlap (threshold ${SIMILARITY_THRESHOLD * 100}%)`
     log(`⚠️ REPETITION: ${msg}`)

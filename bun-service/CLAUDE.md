@@ -39,7 +39,11 @@ The retry prompt is **not** byte-identical to the first: the previous tier's `va
 
 `REPORT_SHAPES` exists because rotating only the opener wasn't enough. Measured over 179 eval reports, the six most common beat orders all ended `… → tide → water temp → verdict` and 88% of reports mentioned water temperature, because paragraph 1's spec *enumerated* the factors to cover and so prescribed the order to cover them in. Replacing that enumeration with a rotated shape cut water-temp mentions to 30% and the "tide is … in your favor" frame from 33% to 23%.
 
-It did **not** fix lexical repetition: top-10 sentence-opener share barely moved (63% → 61%) and the most-shared 7-gram still reaches 16% of reports. Structural rotation fixes structure; the remaining sameness is sentence rhythm and frame reuse, and the untried lever there is canonical examples in the prompt rather than more rules.
+It did **not** fix lexical repetition: top-10 sentence-opener share barely moved (63% → 61%) and the most-shared 7-gram still reaches 16% of reports. Structural rotation fixes structure; the remaining sameness is sentence rhythm and frame reuse.
+
+**That residue was investigated and deliberately left alone — don't re-open it without reading the next section.** Pooled corpus statistics overstate it badly. The case a real user actually experiences is one spot read repeatedly, and on the worst case available (same spot, identical conditions, two reports back to back) six of seven pairs shared **zero** 7-word frames, at 24-32% word overlap. A favourite phrase recurring in 16% of a pooled corpus is a verbal tic, not a template tell — arguably part of the consistent local voice `voiceDescriptor` exists to cultivate. Contrast the structural problem above, which showed up in a *single* read.
+
+If a specific phrase does start grating in production, add it to `GATED_STOCK_PHRASES`; the gate and targeted retry remove it with no prompt surgery. That's much cheaper than another prompt experiment.
 
 Nothing the prompt embeds may contain a phrase from `GATED_STOCK_PHRASES`. `getWaveQuality` used to return "...waves will be quick and choppy", which the prompt passes in as a Wave Quality hint — the model echoed it and was then rejected for it, making it the most-rejected phrase in every eval run. `stock-phrases.test.ts` guards this across every hint branch.
 
@@ -53,7 +57,9 @@ The instruction alone was measurably ~0% effective — 4-5 of every 10 reports c
 
 Three things it reports but does not fail on, because they're instruments for A/B-ing prompt changes rather than regression gates: stock-phrase compliance, shared sentence frames, and sentence-opener concentration. **The jaccard similarity gate is nearly useless for judging variety** — it sits at 22-29% against a 55% threshold on every run, because reports reuse frames and structure while carrying distinct location nouns, which bag-of-words comparison averages away. Use the frame and opener numbers instead.
 
-Both are underpowered within a single 10-report run. To evaluate a prompt change, run the harness several times and pool the transcripts in `eval/output/` — the effects above were only visible at n≈80 or more. Exits non-zero on failure, so it's wired into `.github/workflows/eval-prompt.yml` as a CI gate on changes to `index.ts` or `eval/**`, in addition to being runnable by hand.
+Both are underpowered within a single 10-report run. To evaluate a prompt change, run the harness several times and pool the transcripts in `eval/output/` — the effects above were only visible at n≈80 or more.
+
+**Pool deliberately, and know which number reflects a user.** Most of this harness compares four locations on identical conditions, which is a view no visitor ever has — a reader sees one spot. Cross-location pooling therefore *inflates* apparent repetition (`"you're looking at knee to waist high"` reaches 22% across locations but the same corpus filtered to one spot looks materially better), and it was what made the residual lexical repetition above look worth chasing when it wasn't. The honest user-facing metric is the **Day 1 vs Day 2 pair**: one location, consecutive reports. Judge prose-quality changes on that; use cross-location only for the convergence regression it was built to catch. Exits non-zero on failure, so it's wired into `.github/workflows/eval-prompt.yml` as a CI gate on changes to `index.ts` or `eval/**`, in addition to being runnable by hand.
 
 ## Deployment
 
