@@ -291,7 +291,12 @@ async function runOne(label: string, slug: string, locationName: string, ctx: Lo
   log()
   log(result.report)
 
-  const issues = validateReportText(result.report.split('\n\n'), surfData.details.wind_direction_description ?? null)
+  // Same three arguments generateDetailedSurfReport passes, so the harness re-checks
+  // exactly what production gated on — including the weekday rule, which is inert
+  // without a Local Date.
+  const localDate = new Date(now.toLocaleString('en-US', { timeZone: ctx.timezone }))
+    .toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+  const issues = validateReportText(result.report.split('\n\n'), surfData.details.wind_direction_description ?? null, localDate)
   if (issues.length > 0) {
     log()
     log(`⚠️ VALIDATION FAILED: ${issues.map(i => i.detail).join('; ')}`)

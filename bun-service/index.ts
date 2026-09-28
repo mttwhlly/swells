@@ -26,10 +26,60 @@ const surfReportSchema = z.object({
 // the caller moves on to the next model, then to the deterministic template.
 export interface ReportValidationIssue {
   code: 'banned_opener' | 'word_count' | 'wind_contradiction' | 'fabricated_crowd_count' | 'stock_phrase'
+    | 'size_in_feet' | 'restated_orientation' | 'wrong_date'
   detail: string
 }
 
 const BANNED_OPENERS = [/^right now,?\s+we'?re looking at/i, /^we'?re looking at/i]
+
+// Quoting a size in feet understates the surf: every upstream source reports significant
+// wave height measured offshore, which is smaller than the face a surfer rides, and the
+// whole reason waveSizeOf hands the prompt a body-scale label instead. Measured at 0% for
+// 278 reports since the prompt stopped passing a height in feet at all, so this gate is
+// insurance against a model or prompt change reintroducing it, not a live problem.
+//
+// In a two-paragraph surf report a height in feet is a size claim unless it is plainly a
+// tide height (the prompt does supply that in feet), a depth, or a distance — hence the
+// exclusion rather than a wave-context requirement, which missed bare "1.8 feet just
+// doesn't have the juice".
+const FEET_NUMBER = String.raw`(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|twelve|fifteen|twenty)`
+const SIZE_IN_FEET_PATTERN = new RegExp(
+  String.raw`\b${FEET_NUMBER}(?:\s*(?:-|–|to|\+)\s*${FEET_NUMBER})?[\s-]?(?:ft|foot|feet|footer)s?\b`, 'gi')
+const FEET_BUT_NOT_A_SIZE = /\btides?\b|\btidal\b|\bhigh at\b|\blow at\b|\bdepth\b|\bdeep(?:er)?\b|\bof water\b|\bwater under\b|\bunder you\b|\bfrom (?:the )?(?:shore|beach|pier|bank)\b|\boff (?:the )?(?:shore|beach|pier|bank)\b|\bout from\b|\brange\b/i
+
+function findSizeInFeet(text: string): string | null {
+  for (const m of text.matchAll(SIZE_IN_FEET_PATTERN)) {
+    const context = text.slice(Math.max(0, m.index - 30), m.index + m[0].length + 30)
+    if (FEET_BUT_NOT_A_SIZE.test(context)) continue
+    return m[0]
+  }
+  return null
+}
+
+// LOCAL KNOWLEDGE opens with the spot's cardinal orientation so the model can reason about
+// swell and wind angles — not so it can tell the reader which way the beach faces, which
+// is implied by the location and says nothing. The prompt note alone took this from 18% to
+// 3.4% of reports; the gate removes the rest.
+const RESTATED_ORIENTATION_PATTERN =
+  /\b(?:north|south|east|west|northeast|northwest|southeast|southwest)[\s-]facing\b|\bfac(?:es|ing)\s+(?:due\s+)?(?:north|south|east|west)\b/i
+
+// Weekdays only, deliberately. The prompt's date rule is already obeyed — across 318
+// pooled eval reports the model named the wrong weekday zero times — so this is a cheap
+// deterministic backstop against a regression, not a fix for a live problem.
+//
+// Month names are left to the prose rule: the only two month mentions in that corpus were
+// legitimate seasonal outlook ("come back when the nor'easters start rolling in
+// September"), which is forward-looking, not a claim about what today is.
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+function findWrongWeekday(text: string, localDate: string): string | null {
+  for (const day of WEEKDAY_NAMES) {
+    if (localDate.includes(day)) continue
+    const m = text.match(new RegExp(String.raw`\b${day}\b`, 'i'))
+    if (m) return m[0]
+  }
+  return null
+}
 
 // There is no data source anywhere in the pipeline for who is actually in the water —
 // /api/surfability has no webcam or crowd sensor. Catches the model inventing a headcount
@@ -74,7 +124,11 @@ export function findStockPhrases(text: string): string[] {
   return ALL_STOCK_PATTERNS.flatMap(re => text.match(re) ?? [])
 }
 
-export function validateReportText(paragraphs: string[], windDescription: string | null): ReportValidationIssue[] {
+export function validateReportText(
+  paragraphs: string[],
+  windDescription: string | null,
+  localDate: string | null = null,
+): ReportValidationIssue[] {
   const issues: ReportValidationIssue[] = []
   const combined = paragraphs.join(' ')
 
@@ -117,6 +171,23 @@ export function validateReportText(paragraphs: string[], windDescription: string
   const crowdMatch = combined.match(CROWD_COUNT_PATTERN)
   if (crowdMatch) {
     issues.push({ code: 'fabricated_crowd_count', detail: `Report claims a crowd/headcount with no data to back it ("${crowdMatch[0]}")` })
+  }
+
+  const feetMatch = findSizeInFeet(combined)
+  if (feetMatch) {
+    issues.push({ code: 'size_in_feet', detail: `Report gives the surf size as a number of feet ("${feetMatch}") — describe it on the body scale instead` })
+  }
+
+  const orientationMatch = combined.match(RESTATED_ORIENTATION_PATTERN)
+  if (orientationMatch) {
+    issues.push({ code: 'restated_orientation', detail: `Report restates the spot's cardinal orientation ("${orientationMatch[0]}"), which the reader already knows from the location` })
+  }
+
+  if (localDate) {
+    const dayMatch = findWrongWeekday(combined, localDate)
+    if (dayMatch) {
+      issues.push({ code: 'wrong_date', detail: `Report says "${dayMatch}" but today is ${localDate}` })
+    }
   }
 
   return issues
@@ -237,31 +308,6 @@ function getCompassDirection(degrees: number): string {
     'South', 'SSW', 'SW', 'WSW', 'West', 'WNW', 'NW', 'NNW']
   const index = Math.round(degrees / 22.5) % 16
   return directions[index]
-}
-
-// Feeds the prompt's "Wave Quality (hint)" line, so none of these may contain a phrase
-// from GATED_STOCK_PHRASES — handing the model a banned phrase and then rejecting it for
-// echoing it is a trap of our own making. ("quick and choppy" used to live on line 3 and
-// was the single most-rejected phrase in eval runs as a direct result.)
-function getWaveQuality(height: number, period: number): string {
-  if (period >= 12) return 'Quality groundswell with good power and long rides.'
-  if (period >= 8) return 'Decent swell with moderate power and rideable waves.'
-  if (period >= 6) return 'Short period wind swell — little organisation between sets.'
-  return 'Very short period — expect weak, mushy waves.'
-}
-
-function getTideContext(tideState: string): string {
-  if (tideState === 'Low Falling') return 'Already near low tide and still dropping — sandbars exposed, watch for shallow spots.'
-  if (tideState === 'Low Rising') return 'Just past low tide and filling in — bars exposed now but water coming up.'
-  if (tideState === 'High Rising') return 'Near high tide and still coming in — deep water, waves may be mushier.'
-  if (tideState === 'High Falling') return 'Just past high tide and starting to drain — water still full but dropping.'
-  if (tideState === 'Mid Rising') return 'Mid rising tide — usually the best window for shape and power.'
-  if (tideState === 'Mid Falling') return 'Mid falling tide — still good water on the bars, often decent conditions.'
-  if (tideState.includes('Rising')) return 'Tide rising — typically improves wave shape and power.'
-  if (tideState.includes('Falling')) return 'Tide falling — can expose sandbars but watch for shallowing.'
-  if (tideState.includes('High')) return 'High tide — deeper water but waves may be mushier.'
-  if (tideState.includes('Low')) return 'Low tide — sandbars exposed, watch for shallow sections.'
-  return 'Mid tide — typically the most consistent window.'
 }
 
 /**
@@ -517,7 +563,7 @@ ${ctx.localKnowledge}
 GEOGRAPHIC SETUPS AT THIS LOCATION:
 ${ctx.spotFeatures.map(f => `• ${f.archetype} (e.g. ${pickExample(f.examples)}) — shines when: ${f.shinesWhen}`).join('\n')}
 
-CURRENT CONDITIONS (raw data — reference in your own words, see NOTE below on the two hint lines):
+CURRENT CONDITIONS (raw data — reference in your own words):
 • Surf Size: ${waveSize.descriptor} (this is the size to describe to the reader)
 • Wave Period: ${surfData.details.wave_period_sec} seconds
 • Swell Direction: ${surfData.details.swell_direction_deg}° (${swellDirection})
@@ -527,21 +573,17 @@ CURRENT CONDITIONS (raw data — reference in your own words, see NOTE below on 
 • Water Temp: ${surfData.weather.water_temperature_f}°F
 • Weather: ${surfData.weather.weather_description}
 • Overall Score: ${surfData.score}/100
-• Wave Quality (hint, not a sentence to reuse): ${getWaveQuality(waveSize.faceHeightFt, surfData.details.wave_period_sec)}
-• Tide Context (hint, not a sentence to reuse): ${getTideContext(surfData.details.tide_state)}
 • Local Date: ${localDate}
 • Local Time: ${localTime}
 • Daylight Window: sunrise ~${sunriseStr}, sunset ~${sunsetStr} — nobody surfs before sunrise or after sunset
 • Session Status: ${viabilityNote}
 ${viabilityInstructions}
 NOTE: Do not restate raw figures verbatim in prose (wave height, period, temperature, wind speed, etc.) — interpret and contextualise what they mean for the surf experience instead.
-NOTE ON SIZE: Describe the surf using the body scale given in Surf Size ("waist to chest high", "overhead", and so on), or your own natural equivalent. Do NOT give the size as a number of feet. Forecast models measure significant wave height offshore, which is a smaller number than the face of the wave a surfer actually rides, so quoting feet here would understate the surf and mislead the reader. The body-scale label already accounts for that difference.
-NOTE: The "Wave Quality" and "Tide Context" lines above are internal hints describing what the numbers mean, not sentences to paraphrase or echo. Reach your own conclusion about the surf in your own words — do not restate their wording or sentence shape.
+NOTE ON SIZE: Describe the surf on the body scale given in Surf Size, or your own natural equivalent — never as a number of feet.
 NOTE: Do not state any date, day-of-week, season, or "time of year" framing, and do not claim conditions are typical/atypical for the season — unless it is directly supported by the data given above. If you reference the day or date, it must match Local Date exactly.
 NOTE: You have no data on who is in the water. Never state or imply a headcount ("a dozen heads out", "a few guys", "empty lineup") or describe specific surfers — you cannot observe this and would be inventing it.
-NOTE: LOCAL KNOWLEDGE opens with this spot's cardinal orientation (e.g. "East-facing beach break") so you can reason about which swell and wind directions work here — don't restate it as if it were a detail worth telling the reader ("for this east-facing beach"). It's implied by the location; only surface it if today's specific swell or wind angle relative to that orientation is unusual enough to be worth flagging.
+NOTE: LOCAL KNOWLEDGE opens with this spot's cardinal orientation so you can reason about which swell and wind directions work here. Don't restate it to the reader ("for this east-facing beach") — it's implied by the location.
 
-AVOID GENERIC OPENERS: Never start with "Right now we're looking at", "We're looking at", "Right now, we're looking at", or any close variant of that phrasing — it's the default surf-report cliché and every report should not sound the same.
 AVOID STOCK PHRASES: Don't reach for worn-out crutches like ${STOCK_PHRASES.map(p => `"${p}"`).join(', ')} — find your own words each time, specific to today's conditions.
 THIS CALL'S ANGLE: ${pickOpeningAngle()}
 
@@ -603,6 +645,9 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
 
   const prompt = createDetailedSurfPrompt(surfData, ctx, now)
   const windDescription: string | null = surfData.details.wind_direction_description ?? null
+  // Same string the prompt shows as Local Date, so the gate and the prompt agree on
+  // what "today" is even across a timezone or DST boundary.
+  const localDate = getLocalTime(ctx.timezone, now).date
 
   let lastIssues: ReportValidationIssue[] = []
   let lastError: unknown = null
@@ -628,7 +673,8 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
 
       const issues = validateReportText(
         [aiResponse.conditionsAnalysis, aiResponse.recommendationsAndOutlook],
-        windDescription
+        windDescription,
+        localDate
       )
 
       if (issues.length > 0) {

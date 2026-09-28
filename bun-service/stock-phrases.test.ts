@@ -62,10 +62,15 @@ describe('validateReportText — stock_phrase gating', () => {
   })
 
   // Regression guard for a real trap: getWaveQuality's 6-11s branch used to return
-  // "...waves will be quick and choppy", which the prompt passes in as a Wave Quality
+  // "...waves will be quick and choppy", which the prompt passed in as a Wave Quality
   // hint. The model echoed it and was then rejected for it — "quick and choppy" was the
   // single most-rejected phrase across eval runs as a direct result. Nothing the prompt
   // hands the model may be a phrase we reject it for using.
+  //
+  // Both hint helpers have since been deleted outright (they were pure restatements of
+  // data already in the prompt, and the model paraphrased them into 60% of reports), so
+  // that particular trap can no longer be set. The invariant still has to hold for
+  // everything else the prompt embeds, and the sweep still exercises the data branches.
   it('never feeds a gated stock phrase into the prompt', () => {
     const ctx: LocationContext = {
       locationName: 'Testville, FL',
