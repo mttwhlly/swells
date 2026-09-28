@@ -196,9 +196,18 @@ function formatClockTime(date: Date, timezone: string): string {
   return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: timezone })
 }
 
+// The location's calendar date (YYYY-MM-DD) for an instant, per its own timezone — not UTC.
+// getDaylightWindow anchors its math to now's *UTC* calendar date, which silently rolls
+// over 4-5 hours before local midnight in US timezones (8 PM EDT is already "tomorrow" in
+// UTC). Comparing raw Date instants for "is sunrise today or tomorrow" inherits that skew;
+// comparing local date strings doesn't.
+function localDateKey(date: Date, timezone: string): string {
+  return date.toLocaleDateString('en-CA', { timeZone: timezone })
+}
+
 type SessionViability =
   | { viable: true }
-  | { viable: false; reason: 'night'; riseStr: string; minutesToRise: number; isPreDawn: boolean }
+  | { viable: false; reason: 'night'; riseStr: string; minutesToRise: number; isPreDawn: boolean; sunriseIsLaterToday: boolean }
   | { viable: false; reason: 'lightning' }
 
 // Within this many minutes of sunrise, it's "pre-dawn" (sky lightening) rather than "the middle of the night"
@@ -213,9 +222,12 @@ function getSessionViability(now: Date, lat: number, lon: number, timezone: stri
     const riseStr = formatClockTime(rise, timezone)
     // Before sunrise, minutesToRise is straightforward. After sunset, the next sunrise
     // is tomorrow's — approximate it as today's sunrise time, 24h later.
-    const nextRise = now.getTime() >= set.getTime() ? new Date(rise.getTime() + 86400000) : rise
+    const nextRise = now.getTime() < rise.getTime() ? rise : new Date(rise.getTime() + 86400000)
     const minutesToRise = Math.round((nextRise.getTime() - now.getTime()) / 60000)
-    return { viable: false, reason: 'night', riseStr, minutesToRise, isPreDawn: minutesToRise <= PRE_DAWN_WINDOW_MINUTES }
+    // Whether that next sunrise falls on the viewer's local "today" or "tomorrow" —
+    // compared by local calendar date, not raw instants (see localDateKey).
+    const sunriseIsLaterToday = localDateKey(nextRise, timezone) === localDateKey(now, timezone)
+    return { viable: false, reason: 'night', riseStr, minutesToRise, isPreDawn: minutesToRise <= PRE_DAWN_WINDOW_MINUTES, sunriseIsLaterToday }
   }
   return { viable: true }
 }
@@ -305,7 +317,9 @@ function getFallbackTimingAdvice(tideState: string, viability: SessionViability)
   if (!viability.viable) {
     if (viability.reason === 'lightning') return 'Wait for the storm to clear completely before considering paddling out'
     if (viability.isPreDawn) return `Check back once it's light (~${viability.riseStr}) for an accurate read on conditions`
-    return 'Check back tomorrow for an accurate read on conditions'
+    return viability.sunriseIsLaterToday
+      ? `Check back later this morning (~${viability.riseStr}) for an accurate read on conditions`
+      : `Check back tomorrow morning (~${viability.riseStr}) for an accurate read on conditions`
   }
   if (tideState.includes('Rising')) return 'Session now — rising tide tends to clean up the waves'
   if (tideState.includes('Falling')) return 'Go sooner rather than later — falling tide can get shallow over the sandbars'
@@ -454,22 +468,28 @@ There is active lightning or thunderstorm activity. This overrides everything el
 - Lead paragraph 1 with a clear, direct safety warning: the ocean is UNSAFE during electrical activity. No hedging.
 - Paragraph 2 should describe what conditions will look like once the storm clears, and when to check back.
 - timingAdvice must tell the user to wait until the storm passes before considering the water.`
-    : viability.isPreDawn
-    ? `
+    : (() => {
+        const checkBackPhrase = viability.sunriseIsLaterToday
+          ? `later this morning, around ${viability.riseStr}`
+          : `tomorrow morning, around ${viability.riseStr}`
+        return viability.isPreDawn
+        ? `
 IMPORTANT — TIMING OVERRIDE:
 It is currently pre-dawn (still dark, but sunrise is only ~${viability.minutesToRise} minutes away at ${viability.riseStr}). This is NOT "the middle of the night" — do not use that phrase or imply it's late-night. Say it's early morning / not light enough yet / sunrise is close.
-- Do NOT attempt to describe or predict tomorrow's conditions — you have no forecast data, only a current snapshot that may not reflect what daylight will bring.
-- Do not point out that nobody's in the water or nobody's surfing yet — it's self-evident that it's too dark to surf and doesn't need to be said.
-- Paragraph 1: acknowledge it's still too dark to surf but sunrise is coming soon. If the user seems curious about conditions, you may briefly describe the CURRENT snapshot (not as a prediction).
-- Paragraph 2: keep it short. Tell them conditions can be properly assessed once it's light. No guessing, no false optimism.
-- timingAdvice: mention checking back once it's light, referencing the approximate sunrise time.`
-    : `
+- Do NOT attempt to describe or predict conditions once it's light — you have no forecast data, only a current snapshot that may not hold once the sun's up.
+- Do not explain or dwell on why surfing isn't happening right now (nobody's out, it's too dark, etc.) — that's self-evident. State it in passing and move on.
+- Paragraph 1 is the ONLY place to describe conditions: one concise read of the current snapshot (size, wind, tide), noting briefly that it's still too dark to go. Do not repeat this assessment in paragraph 2.
+- Paragraph 2: one short line pointing to ${checkBackPhrase} for an accurate read. Don't restate the conditions you just gave, and don't claim they'll "look promising" or "hold" — you don't know that yet.
+- timingAdvice: reference ${viability.riseStr} specifically, not a vague "check back later".`
+        : `
 IMPORTANT — TIMING OVERRIDE:
-It is currently nighttime. Nobody surfs in the dark.
-- Do NOT attempt to describe or predict tomorrow's conditions — you have no forecast data, only a current snapshot that may not reflect what morning will bring.
-- Paragraph 1: acknowledge it's night and surfing isn't happening, in one line — don't pad it with a tautology like "daylight won't return until dawn" or "it'll stay dark until sunrise" (dawn/sunrise being when light returns is definitionally true and says nothing). If the user seems curious about conditions, you may briefly describe the CURRENT snapshot (not as a prediction).
-- Paragraph 2: keep it short. Tell them to come back tomorrow when conditions can be properly assessed. No guessing, no false optimism.
-- timingAdvice: "Check back tomorrow" — nothing more specific.`
+It is currently nighttime — too dark to surf. Sunrise is ${checkBackPhrase}.
+- Do NOT attempt to describe or predict conditions once it's light — you have no forecast data, only a current snapshot that may not hold once the sun's up.
+- Do not explain or dwell on why surfing isn't happening right now (nobody's out, waiting for a wave that's not coming, etc.) — that's self-evident. State it in passing and move on.
+- Paragraph 1 is the ONLY place to describe conditions: one concise read of the current snapshot (size, wind, tide). Do not repeat this assessment in paragraph 2.
+- Paragraph 2: one short line pointing to ${checkBackPhrase} for an accurate read. Don't restate the conditions you just gave, and don't claim they'll "look promising" or "hold" — you don't know that yet. Never say "tomorrow" — sunrise is ${viability.sunriseIsLaterToday ? 'later today' : 'tomorrow'}, say so correctly.
+- timingAdvice: reference ${viability.riseStr} and whether that's later today or tomorrow morning — not a bare "check back tomorrow".`
+      })()
 
   const daylight = getDaylightWindow(ctx.lat, ctx.lon, now)
   const sunriseStr = formatClockTime(daylight.rise, ctx.timezone)
@@ -700,12 +720,11 @@ function createEnhancedFallbackReport(surfData: any, windMph: number, ctx: Locat
     }
     // Body scale, not feet — wave_height_ft is offshore Hs, not the face a surfer rides.
     const nightSize = waveSizeOf(surfData).descriptor
-    const p1 = viability.isPreDawn
-      ? `Still too dark to surf at ${ctx.locationName} — sunrise is around ${viability.riseStr}. If you're still curious, the current snapshot shows ${nightSize} waves at ${surfData.details.wave_period_sec}s from the ${surfData.details.swell_direction_compass || 'east'} with ${windMph} mph ${surfData.details.wind_direction_compass || 'variable'} winds, but that's right now — not a forecast for once it's light.`
-      : `It's dark out — no surfing tonight at ${ctx.locationName}. If you're still curious, the current snapshot shows ${nightSize} waves at ${surfData.details.wave_period_sec}s from the ${surfData.details.swell_direction_compass || 'east'} with ${windMph} mph ${surfData.details.wind_direction_compass || 'variable'} winds, but that's right now — not a forecast for tomorrow.`
-    const p2 = viability.isPreDawn
-      ? `Check back once the sun's up (~${viability.riseStr}) for an accurate read on conditions. No guessing in the dark.`
-      : `Check back tomorrow for an accurate read on conditions. Night surf isn't worth it, and neither is guessing.`
+    const checkBackPhrase = viability.sunriseIsLaterToday
+      ? `later this morning (~${viability.riseStr})`
+      : `tomorrow morning (~${viability.riseStr})`
+    const p1 = `Too dark to surf at ${ctx.locationName} right now — sunrise is ${checkBackPhrase}. Current snapshot: ${nightSize} waves at ${surfData.details.wave_period_sec}s from the ${surfData.details.swell_direction_compass || 'east'} with ${windMph} mph ${surfData.details.wind_direction_compass || 'variable'} winds.`
+    const p2 = `Check back ${checkBackPhrase} for an accurate read — this snapshot won't necessarily hold once it's light.`
     return `${p1}\n\n${p2}`
   }
 
