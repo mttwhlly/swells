@@ -1,7 +1,7 @@
 import { serve } from "bun"
 import { generateObject } from 'ai'
 import { createAnthropic } from '@ai-sdk/anthropic'
-import { openai } from '@ai-sdk/openai'
+import { createOpenAI } from '@ai-sdk/openai'
 import { z } from 'zod'
 
 const surfReportSchema = z.object({
@@ -677,12 +677,49 @@ const anthropic = createAnthropic({
   },
 })
 
-const MODEL_TIERS = [
+// Same story for gpt-6-luna on AI SDK v4's chat-completions path: it rejects `max_tokens`
+// (wants `max_completion_tokens`), and rejects function tools — which generateObject uses —
+// unless reasoning is off. It does accept temperature, so that's left alone.
+const openai = createOpenAI({
+  fetch: async (url, init) => {
+    if (typeof init?.body === 'string') {
+      const { max_tokens, ...body } = JSON.parse(init.body)
+      if (max_tokens !== undefined) body.max_completion_tokens = max_tokens
+      body.reasoning_effort = 'none'
+      init = { ...init, body: JSON.stringify(body) }
+    }
+    return fetch(url, init)
+  },
+})
+
+export const MODEL_TIERS = [
   { backend: 'anthropic-primary', modelId: 'claude-haiku-5-5', model: anthropic('claude-haiku-5-5') },
-  { backend: 'openai-secondary', modelId: 'gpt-4o-mini', model: openai('gpt-4o-mini') },
+  { backend: 'openai-secondary', modelId: 'gpt-6-luna', model: openai('gpt-6-luna') },
 ] as const
 
-export async function generateDetailedSurfReport(surfData: any, ctx: LocationContext, now: Date = new Date()) {
+type ModelTier = (typeof MODEL_TIERS)[number]
+
+// A tier the API refused outright (4xx other than rate limiting) is a configuration bug —
+// a parameter the model no longer accepts, a retired model id — not bad luck. The ladder
+// hides it in production by falling through to the next tier, so it's recorded here for the
+// eval harness to fail on. Both model upgrades hit exactly this and still passed the eval.
+export interface TierError { backend: string; status: number | null; message: string }
+
+function tierErrorFrom(backend: string, error: unknown): TierError {
+  const status = typeof (error as any)?.statusCode === 'number' ? (error as any).statusCode : null
+  return { backend, status, message: error instanceof Error ? error.message : String(error) }
+}
+
+export function isConfigurationError(e: TierError): boolean {
+  return e.status !== null && e.status >= 400 && e.status < 500 && e.status !== 429
+}
+
+export async function generateDetailedSurfReport(
+  surfData: any,
+  ctx: LocationContext,
+  now: Date = new Date(),
+  tiers: readonly ModelTier[] = MODEL_TIERS,
+) {
   console.log(`🤖 Generating surf report for ${ctx.locationName}...`)
 
   const prompt = createDetailedSurfPrompt(surfData, ctx, now)
@@ -694,8 +731,9 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
 
   let lastIssues: ReportValidationIssue[] = []
   let lastError: unknown = null
+  const tierErrors: TierError[] = []
 
-  for (const tier of MODEL_TIERS) {
+  for (const tier of tiers) {
     try {
       // Retrying with the byte-identical prompt wastes the tier: the next model has no
       // idea why the last one was rejected and is free to trip the same rule (observed —
@@ -752,12 +790,14 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
           paragraphs: 2,
           prompt_version: '3.3',
           validation_issues: [] as string[],
+          tier_errors: tierErrors,
         }
       }
 
     } catch (error) {
       console.error(`❌ ${tier.backend} generation failed for ${ctx.locationName}:`, error)
       lastError = error
+      tierErrors.push(tierErrorFrom(tier.backend, error))
     }
   }
 
@@ -796,6 +836,7 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
       paragraphs: 2,
       prompt_version: '3.3',
       validation_issues: lastIssues.map(i => i.detail),
+      tier_errors: tierErrors,
     }
   }
 }

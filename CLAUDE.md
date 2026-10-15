@@ -66,7 +66,7 @@ Browser → /api/surf-report (GET)
 
 Report generation is **not done inside Next.js** — but its source *is* in this repo, at [`bun-service/`](bun-service/CLAUDE.md). Only the *deployment* is separate: it ships as its own Docker image on Coolify (base directory `/bun-service`), and `BUN_SERVICE_URL` points the Next.js app at it over HTTP. Edit the prompt, the model ladder, or the generation fallbacks in `bun-service/index.ts`, not in `src/`.
 
-The service runs a model ladder — Claude Haiku 5.5 (`@ai-sdk/anthropic`) primary, GPT-4o-mini (`@ai-sdk/openai`) secondary if the primary errors or fails `validateReportText`, then a deterministic non-AI template. The Next.js `surf-report` route only calls the service; if it's unreachable entirely, Next.js falls back to its own local text template (`createDetailedFallbackReport`). Note there are therefore **two** deterministic templates — one in each process — and they need to stay in step.
+The service runs a model ladder — Claude Haiku 5.5 (`@ai-sdk/anthropic`) primary, `gpt-6-luna` (`@ai-sdk/openai`) secondary if the primary errors or fails `validateReportText`, then a deterministic non-AI template. The Next.js `surf-report` route only calls the service; if it's unreachable entirely, Next.js falls back to its own local text template (`createDetailedFallbackReport`). Note there are therefore **two** deterministic templates — one in each process — and they need to stay in step.
 
 ### External data sources (all in `/api/surfability/route.ts`)
 

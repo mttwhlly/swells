@@ -10,7 +10,14 @@
 //      re-checked on every run so it can't silently regress.
 // Exits non-zero on any failure so this can run as a CI gate, not just by hand.
 
-import { generateDetailedSurfReport, getSessionViability, validateReportText, findStockPhrases, type LocationContext } from '../index'
+import { generateDetailedSurfReport, getSessionViability, validateReportText, findStockPhrases, isConfigurationError, MODEL_TIERS, type LocationContext } from '../index'
+
+// EVAL_TIERS=openai-secondary runs every scenario on that tier alone. The secondary only
+// writes a report when the primary fails, so a normal run barely exercises it — this is how
+// a secondary model change gets evaluated before it ships.
+const EVAL_TIERS = process.env.EVAL_TIERS?.split(',').map(s => s.trim()).filter(Boolean)
+const TIERS = EVAL_TIERS ? MODEL_TIERS.filter(t => EVAL_TIERS.includes(t.backend)) : MODEL_TIERS
+if (TIERS.length === 0) throw new Error(`EVAL_TIERS=${process.env.EVAL_TIERS} matches no backend in MODEL_TIERS (${MODEL_TIERS.map(t => t.backend).join(', ')})`)
 
 interface MockConditions {
   wave_height_ft: number
@@ -286,7 +293,7 @@ function openerConcentration(reports: string[]) {
 async function runOne(label: string, slug: string, locationName: string, ctx: LocationContext, c: MockConditions, now: Date): Promise<string> {
   header(label)
   const surfData = mockSurfData(slug, locationName, c)
-  const result = await generateDetailedSurfReport(surfData, ctx, now)
+  const result = await generateDetailedSurfReport(surfData, ctx, now, TIERS)
   log(`[backend: ${result.generation_meta.backend}, words: ${result.generation_meta.word_count}]`)
   log()
   log(result.report)
@@ -310,6 +317,12 @@ async function runOne(label: string, slug: string, locationName: string, ctx: Lo
     log()
     log(`📉 STOCK PHRASES: ${stockHits.map(h => `"${h}"`).join(', ')}`)
   }
+  // The ladder falls through a refused tier silently, so "every scenario produced a valid
+  // report" can hide a model that never answers. Fail on it explicitly.
+  for (const e of result.generation_meta.tier_errors.filter(isConfigurationError)) {
+    log(`⚠️ ${e.backend} was refused by its API (HTTP ${e.status}): ${e.message}`)
+    failures.push(`${label}: ${e.backend} refused with HTTP ${e.status} — ${e.message}`)
+  }
   if (result.generation_meta.backend === 'bun-fallback') {
     fallbackLabels.add(label)
     // The per-tier rejection reasons only reach console.warn, which the transcript never
@@ -324,6 +337,7 @@ async function runOne(label: string, slug: string, locationName: string, ctx: Lo
 }
 
 async function main() {
+  log(`Model tiers under test: ${TIERS.map(t => `${t.backend} (${t.modelId})`).join(' → ')}`)
   header('CROSS-LOCATION: identical mediocre conditions across 4 locations')
   log('(Testing whether output converges on the same template regardless of place.)')
   const crossLocation: Array<{ label: string; text: string }> = []
