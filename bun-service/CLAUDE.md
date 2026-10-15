@@ -20,7 +20,9 @@ bun start    # production run
 
 Single-file service (`index.ts`) deployed as a Docker container on Coolify. Receives a cron trigger, fetches surf data from the Next.js app, generates an AI report, and saves the result back to the Next.js app.
 
-**Model fallback ladder** (`generateDetailedSurfReport`, `MODEL_TIERS`): Claude Haiku 5.5 (`claude-haiku-5-5`, `@ai-sdk/anthropic`) is primary — it rejects `temperature`, which AI SDK v4 always sends, so its provider's `fetch` strips the field (and turns on strict tool use, which v4 can't, after Haiku 5.5 leaked tool-call markup into the nested `recommendations` object); if it errors, or its output fails `validateReportText` (banned openers, word-count sanity, contradicting the wind onshore/offshore ground truth, inventing a crowd count, leaning on a gated stock phrase, quoting the surf size in feet, restating the spot's cardinal orientation, or naming a weekday that isn't today's), the prompt is retried against OpenAI `gpt-6-luna` (`@ai-sdk/openai`) as a secondary model. That provider has its own `fetch` too: on AI SDK v4's chat-completions path, gpt-6-luna needs `max_completion_tokens` instead of `max_tokens`, and `reasoning_effort: 'none'` before it will accept the function tool `generateObject` uses.
+**Model fallback ladder** (`generateDetailedSurfReport`, `MODEL_TIERS`): Claude Haiku 5.5 (`claude-haiku-5-5`, `@ai-sdk/anthropic`) is primary; if it errors, or its output fails `validateReportText` (banned openers, word-count sanity, contradicting the wind onshore/offshore ground truth, inventing a crowd count, leaning on a gated stock phrase, quoting the surf size in feet, restating the spot's cardinal orientation, naming a weekday that isn't today's, or saying "tonight"/"tomorrow" after midnight), the prompt is retried against OpenAI `gpt-6-luna` (`@ai-sdk/openai`, Responses API) as a secondary model. Generation is `generateText` with `Output.object` (AI SDK 7 — `generateObject` is deprecated), which gives both tiers constrained decoding for the schema. Neither tier is sent a temperature; both models reject one.
+
+Reasoning is set per tier in `MODEL_TIERS`, and both settings were measured, not defaulted — see the comment there. Haiku 5.5 is `'none'`: left to its adaptive default it spent the whole 800-token budget thinking and returned nothing. gpt-6-luna is `'low'`: on a secondary-only eval it obeyed the night override and matched `shinesWhen` conditions where `'none'` didn't, for ~2x tokens and ~7s instead of ~4s. Reasoning tokens count toward `maxOutputTokens`, so raise the budget with the effort. The strict `json_schema` OpenAI uses requires every property, so schema fields are `.nullable()`, never `.optional()`.
 
 **A tier the API refuses is recorded, and fails the eval.** The ladder falls through a refused tier silently, so both model upgrades above initially "passed" the eval while the new model answered nothing. `generation_meta.tier_errors` records each tier's error and HTTP status; the harness fails on any 4xx other than 429 (`isConfigurationError`). Transient 429/5xx failures are left to the ladder.
 
@@ -29,7 +31,7 @@ The retry prompt is **not** byte-identical to the first: the previous tier's `va
 **Cron flow:**
 1. GitHub Actions calls `POST /cron/generate-fresh-report` with `{ cronSecret, vercelUrl }`
 2. This service fetches `vercelUrl/api/surfability`
-3. Runs the model fallback ladder above via `generateObject` (Vercel AI SDK)
+3. Runs the model fallback ladder above via `generateText` + `Output.object` (Vercel AI SDK 7)
 4. POSTs result to `vercelUrl/api/admin/save-report`
 
 **Direct flow:**

@@ -1,7 +1,7 @@
 import { serve } from "bun"
-import { generateObject } from 'ai'
-import { createAnthropic } from '@ai-sdk/anthropic'
-import { createOpenAI } from '@ai-sdk/openai'
+import { APICallError, generateText, Output, RetryError, type LanguageModel } from 'ai'
+import { anthropic } from '@ai-sdk/anthropic'
+import { openai } from '@ai-sdk/openai'
 import { z } from 'zod'
 
 const surfReportSchema = z.object({
@@ -10,7 +10,8 @@ const surfReportSchema = z.object({
 
   recommendations: z.object({
     boardType: z.string().describe("General board type recommendation (longboard, shortboard, funboard) - NO specific sizes"),
-    wetsuitThickness: z.string().optional().describe("Wetsuit recommendation"),
+    // Nullable, not optional: OpenAI's strict json_schema requires every property to be listed.
+    wetsuitThickness: z.string().nullable().describe("Wetsuit recommendation, or null if none is needed"),
     skillLevel: z.enum(['beginner', 'intermediate', 'advanced']).describe("Recommended skill level"),
     bestSpots: z.array(z.string()).describe("The example spot(s) actually named in paragraph 2, reflecting the geographic setup that matches today's conditions. Empty if paragraph 2 said the options are comparable today rather than naming one."),
     timingAdvice: z.string().describe("When to surf — or when to check back if conditions are not currently viable. Must stay within the prompt's Daylight Window (never recommend surfing, or waiting for a tide change, after sunset or before sunrise).")
@@ -653,51 +654,52 @@ function reportConditions(surfData: any) {
 
 // Model tiers, tried in order. Anthropic is primary; OpenAI is a same-shape secondary
 // so a single provider outage doesn't drop straight to the hardcoded template. Each
-// tier's output is schema-validated by generateObject AND fact-checked by
+// tier's output is schema-validated by Output.object AND fact-checked by
 // validateReportText — either failure moves to the next tier.
 //
-// Claude Haiku 5.5 rejects `temperature` outright ("`temperature` is deprecated for this
-// model"), and AI SDK v4 can't omit it — prepareCallSettings turns an unset temperature
-// into 0 and sends it anyway. Left in, every primary call 400s and all traffic silently
-// lands on the secondary (the eval still passes, so this is easy to miss). Strip it from
-// the request body instead. Remove this once the SDK is on v5+, which no longer defaults it.
+// Neither tier takes a temperature: Claude Haiku 5.5 and GPT-6 both reject sampling
+// parameters (the providers drop one with a warning). Both get constrained decoding for
+// the schema — Anthropic through `output_config.format` (before that, Haiku 5.5 leaked
+// tool-call markup into the nested `recommendations` object in 2 of 10 eval reports),
+// OpenAI through a strict `json_schema` on the Responses API.
 //
-// The same wrapper turns on strict tool use, which v4 has no option for. Without it Haiku 5.5
-// intermittently leaks tool-call markup into the nested object — `recommendations` arrived
-// as the string "\n<parameter name=\"boardType\">funboard" in 2 of 10 eval reports —
-// failing schema validation and costing the tier. Strict guarantees the input matches.
-const anthropic = createAnthropic({
-  fetch: async (url, init) => {
-    if (typeof init?.body === 'string') {
-      const { temperature: _temperature, ...body } = JSON.parse(init.body)
-      for (const tool of body.tools ?? []) tool.strict = true
-      init = { ...init, body: JSON.stringify(body) }
-    }
-    return fetch(url, init)
+// Reasoning is set per tier, deliberately:
+// - Haiku 5.5 runs adaptive thinking by default, and once the schema stopped being a forced
+//   tool call it spent the whole 800-token budget thinking and returned nothing. It never
+//   thought on the old forced-tool path either, so 'none' keeps the behaviour it was
+//   evaluated with.
+// - gpt-6-luna was stuck at 'none' on the old chat-completions path. Measured over a
+//   secondary-only eval each way, 'low' obeyed the night override that 'none' ignored
+//   (it described a session at 2am) and picked the setup whose shinesWhen conditions
+//   matched where 'none' hedged, for ~2x output tokens and ~7s instead of ~4s per call.
+//   The secondary mostly runs inside the cron, and often to repair a rejected primary
+//   report, so following instructions is worth more than the latency. Reasoning counts
+//   toward maxOutputTokens, hence the larger budget; summaries are never read.
+type GenerateTextOptions = Parameters<typeof generateText>[0]
+
+export interface ModelTier extends Pick<GenerateTextOptions, 'maxOutputTokens' | 'reasoning' | 'providerOptions'> {
+  backend: string
+  modelId: string
+  model: LanguageModel
+}
+
+export const MODEL_TIERS: readonly ModelTier[] = [
+  {
+    backend: 'anthropic-primary',
+    modelId: 'claude-haiku-5-5',
+    model: anthropic('claude-haiku-5-5'),
+    maxOutputTokens: 800,
+    reasoning: 'none',
   },
-})
-
-// Same story for gpt-6-luna on AI SDK v4's chat-completions path: it rejects `max_tokens`
-// (wants `max_completion_tokens`), and rejects function tools — which generateObject uses —
-// unless reasoning is off. It does accept temperature, so that's left alone.
-const openai = createOpenAI({
-  fetch: async (url, init) => {
-    if (typeof init?.body === 'string') {
-      const { max_tokens, ...body } = JSON.parse(init.body)
-      if (max_tokens !== undefined) body.max_completion_tokens = max_tokens
-      body.reasoning_effort = 'none'
-      init = { ...init, body: JSON.stringify(body) }
-    }
-    return fetch(url, init)
+  {
+    backend: 'openai-secondary',
+    modelId: 'gpt-6-luna',
+    model: openai('gpt-6-luna'),
+    maxOutputTokens: 2000,
+    reasoning: 'low',
+    providerOptions: { openai: { reasoningSummary: null } },
   },
-})
-
-export const MODEL_TIERS = [
-  { backend: 'anthropic-primary', modelId: 'claude-haiku-5-5', model: anthropic('claude-haiku-5-5') },
-  { backend: 'openai-secondary', modelId: 'gpt-6-luna', model: openai('gpt-6-luna') },
-] as const
-
-type ModelTier = (typeof MODEL_TIERS)[number]
+]
 
 // A tier the API refused outright (4xx other than rate limiting) is a configuration bug —
 // a parameter the model no longer accepts, a retired model id — not bad luck. The ladder
@@ -705,8 +707,11 @@ type ModelTier = (typeof MODEL_TIERS)[number]
 // eval harness to fail on. Both model upgrades hit exactly this and still passed the eval.
 export interface TierError { backend: string; status: number | null; message: string }
 
-function tierErrorFrom(backend: string, error: unknown): TierError {
-  const status = typeof (error as any)?.statusCode === 'number' ? (error as any).statusCode : null
+// A retryable failure (429/5xx) that exhausts the SDK's retries arrives wrapped in a
+// RetryError, which carries no status of its own — read it off the last attempt.
+export function tierErrorFrom(backend: string, error: unknown): TierError {
+  const apiError = RetryError.isInstance(error) ? error.lastError : error
+  const status = APICallError.isInstance(apiError) ? apiError.statusCode ?? null : null
   return { backend, status, message: error instanceof Error ? error.message : String(error) }
 }
 
@@ -744,12 +749,14 @@ export async function generateDetailedSurfReport(
 A PREVIOUS ATTEMPT AT THIS REPORT WAS REJECTED. Fix these specific problems, and do not reintroduce them:
 ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
 
-      const { object: aiResponse } = await generateObject({
+      const startedAt = Date.now()
+      const { output: aiResponse, usage } = await generateText({
         model: tier.model,
-        schema: surfReportSchema,
+        output: Output.object({ schema: surfReportSchema }),
         prompt: tierPrompt,
-        temperature: 0.6,
-        maxTokens: 800,
+        maxOutputTokens: tier.maxOutputTokens,
+        reasoning: tier.reasoning,
+        providerOptions: tier.providerOptions,
       })
 
       const issues = validateReportText(
@@ -776,7 +783,7 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
         conditions: reportConditions(surfData),
         recommendations: {
           board_type: aiResponse.recommendations.boardType,
-          wetsuit_thickness: aiResponse.recommendations.wetsuitThickness,
+          wetsuit_thickness: aiResponse.recommendations.wetsuitThickness ?? undefined,
           skill_level: aiResponse.recommendations.skillLevel,
           best_spots: aiResponse.recommendations.bestSpots,
           timing_advice: aiResponse.recommendations.timingAdvice
@@ -791,6 +798,11 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
           prompt_version: '3.3',
           validation_issues: [] as string[],
           tier_errors: tierErrors,
+          // The winning call only — what this report cost, not what the ladder did to get here.
+          latency_ms: Date.now() - startedAt,
+          input_tokens: usage.inputTokens,
+          output_tokens: usage.outputTokens,
+          reasoning_tokens: usage.outputTokenDetails.reasoningTokens,
         }
       }
 

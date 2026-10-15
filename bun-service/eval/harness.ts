@@ -245,6 +245,10 @@ const stockPhraseHits: Array<{ label: string; hits: string[] }> = []
 const allReports: Array<{ label: string; text: string }> = []
 const fallbackLabels = new Set<string>()
 
+// Latency and tokens of each report's winning model call — the numbers a model or
+// reasoning-effort change trades against quality.
+const callCosts: Array<{ latencyMs: number; outputTokens: number; reasoningTokens: number }> = []
+
 const normalise = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9'\s]/g, ' ').replace(/\s+/g, ' ').trim()
 
@@ -294,7 +298,12 @@ async function runOne(label: string, slug: string, locationName: string, ctx: Lo
   header(label)
   const surfData = mockSurfData(slug, locationName, c)
   const result = await generateDetailedSurfReport(surfData, ctx, now, TIERS)
-  log(`[backend: ${result.generation_meta.backend}, words: ${result.generation_meta.word_count}]`)
+  const meta = result.generation_meta
+  const cost = meta.latency_ms !== undefined
+    ? `, ${meta.latency_ms}ms, ${meta.input_tokens} in / ${meta.output_tokens} out${meta.reasoning_tokens ? ` (${meta.reasoning_tokens} reasoning)` : ''}`
+    : ''
+  log(`[backend: ${meta.backend}, words: ${meta.word_count}${cost}]`)
+  if (meta.latency_ms !== undefined) callCosts.push({ latencyMs: meta.latency_ms, outputTokens: meta.output_tokens ?? 0, reasoningTokens: meta.reasoning_tokens ?? 0 })
   log()
   log(result.report)
 
@@ -411,6 +420,14 @@ async function main() {
   }
   for (const { gram, docs } of frames7.slice(0, 6)) {
     log(`    shared by ${docs}: "${gram}"`)
+  }
+
+  header('LATENCY AND TOKENS (winning model call per report)')
+  if (callCosts.length > 0) {
+    const sorted = callCosts.map(c => c.latencyMs).sort((a, b) => a - b)
+    const mean = (xs: number[]) => Math.round(xs.reduce((a, b) => a + b, 0) / xs.length)
+    log(`  latency: p50 ${sorted[Math.floor(sorted.length / 2)]}ms, mean ${mean(sorted)}ms, max ${sorted[sorted.length - 1]}ms`)
+    log(`  output tokens: mean ${mean(callCosts.map(c => c.outputTokens))} (of which reasoning: mean ${mean(callCosts.map(c => c.reasoningTokens))})`)
   }
 
   header('STOCK PHRASE COMPLIANCE')
