@@ -108,6 +108,7 @@ src/app/
 │   ├── audio-report/                # On-demand ElevenLabs TTS
 │   ├── location-request/           # "Suggest a spot" form handler
 │   ├── health/                      # Dependency-aware readiness check
+│   ├── now/                         # Public St. Augustine status phrase for mattwhalley.com
 │   └── admin/
 │       ├── request-forecast/       # Cron entrypoint — clears cache, triggers regeneration, alerts on failure
 │       └── save-report/             # Receives generated reports from the Bun service
@@ -120,6 +121,9 @@ src/app/
 │   ├── db.ts                       # Neon queries
 │   ├── locations.ts                # The 7 locations — local knowledge, coast orientation, buoy calibration
 │   ├── waveSize.ts                 # Hs -> face height -> body-scale descriptor
+│   ├── sessionViability.ts         # Day/night/lightning check (mirror of bun-service's)
+│   ├── surfStatus.ts               # Stored conditions -> short phrase for /api/now
+│   ├── wind.ts                     # Offshore/onshore for a coast orientation
 │   ├── push.ts                     # Threshold matching + web-push delivery
 │   └── alerts.ts                   # Resend-based reliability alerting
 └── types/surf-report.ts
@@ -127,7 +131,11 @@ src/app/
 bun-service/
 ├── index.ts                        # Model fallback ladder, prompt, validation, HTTP handlers
 ├── waveSize.test.ts                # Unit tests + drift guard against src/app/lib/waveSize.ts
+├── session-viability.test.ts       # Drift guard against src/app/lib/sessionViability.ts
+├── report-rules.test.ts            # Report-validation gates and the eval's win-rate gate
+├── model-tiers.test.ts             # Tier error mapping and per-tier timeouts (offline)
 ├── eval/harness.ts                 # Golden-scenario eval harness (CI-gated, calls real models)
+├── eval/win-rate.ts                # Which tier wrote each report; fails if the primary loses ≥50%
 └── CLAUDE.md
 ```
 
@@ -138,6 +146,7 @@ bun-service/
 - `GET /api/audio-report?location=<slug>` — TTS audio of the current report
 - `POST /api/location-request` — spot suggestion form
 - `GET /api/health` — dependency-aware readiness check
+- `GET /api/now` — public `{ status, updatedAt }` for St. Augustine ("clean and waist-high"); reads the stored report only, `status: null` when missing or over 6h old, edge-cached 20 min, CORS limited to mattwhalley.com and localhost/127.0.0.1 on any port
 - `GET /api/admin/request-forecast` — cron entrypoint (requires `CRON_SECRET`)
 
 ## Deployment
