@@ -26,7 +26,7 @@ const surfReportSchema = z.object({
 // the caller moves on to the next model, then to the deterministic template.
 export interface ReportValidationIssue {
   code: 'banned_opener' | 'word_count' | 'wind_contradiction' | 'fabricated_crowd_count' | 'stock_phrase'
-    | 'size_in_feet' | 'restated_orientation' | 'wrong_date'
+    | 'size_in_feet' | 'restated_orientation' | 'wrong_date' | 'wrong_day_reference'
   detail: string
 }
 
@@ -85,7 +85,9 @@ function findWrongWeekday(text: string, localDate: string): string | null {
 // /api/surfability has no webcam or crowd sensor. Catches the model inventing a headcount
 // or specific-people claim (e.g. "maybe a dozen heads out at Vilano") when the "crowd/vibe"
 // opening angle gets picked with nothing real to describe.
-const CROWD_COUNT_PATTERN = /\b(?:a\s+)?(?:handful|dozen|couple|few|bunch)\s+of\s+(?:surfers|guys|people|heads)\b|\b\d+\s+(?:surfers|guys|people|heads)\b|\bheads?\s+(?:out|in the water)\b|\b(?:empty|crowded|packed)\s+lineup\b/i
+// Plural "heads" only: singular "head out" is the verb ("head out once it's light"), and
+// gating it rejected compliant night reports, which point the reader to sunrise.
+const CROWD_COUNT_PATTERN = /\b(?:a\s+)?(?:handful|dozen|couple|few|bunch)\s+of\s+(?:surfers|guys|people|heads)\b|\b\d+\s+(?:surfers|guys|people|heads)\b|\bheads\s+(?:out|in the water)\b|\b(?:empty|crowded|packed)\s+lineup\b/i
 
 // Worn-out surf-report crutches. Single source of truth: the AVOID STOCK PHRASES line in
 // createDetailedSurfPrompt is generated from STOCK_PHRASES, so the list the model is told
@@ -124,10 +126,19 @@ export function findStockPhrases(text: string): string[] {
   return ALL_STOCK_PATTERNS.flatMap(re => text.match(re) ?? [])
 }
 
+// A night report is deliberately terse — the prompt asks for a one-line paragraph 2 that
+// just points to sunrise — so the daytime 25-word floor would reject every compliant one.
+const NIGHT_MIN_PARAGRAPH_WORDS = 8
+
+// Between local midnight and sunrise, the next light is *later today*. "Tonight" and
+// "tomorrow" are both wrong then, and the prompt saying so was not enough on its own.
+const WRONG_DAY_REFERENCE_PATTERN = /\b(tonight|tomorrow)\b/i
+
 export function validateReportText(
   paragraphs: string[],
   windDescription: string | null,
   localDate: string | null = null,
+  viability: SessionViability | null = null,
 ): ReportValidationIssue[] {
   const issues: ReportValidationIssue[] = []
   const combined = paragraphs.join(' ')
@@ -137,12 +148,21 @@ export function validateReportText(
     issues.push({ code: 'banned_opener', detail: 'Opens with the generic "looking at" cliche' })
   }
 
+  const isNight = viability !== null && !viability.viable && viability.reason === 'night'
+  const minWords = isNight ? NIGHT_MIN_PARAGRAPH_WORDS : 25
   paragraphs.forEach((p, i) => {
     const words = p.trim().split(/\s+/).filter(Boolean).length
-    if (words < 25 || words > 130) {
-      issues.push({ code: 'word_count', detail: `Paragraph ${i + 1} is ${words} words (expected roughly 25-130)` })
+    if (words < minWords || words > 130) {
+      issues.push({ code: 'word_count', detail: `Paragraph ${i + 1} is ${words} words (expected roughly ${minWords}-130)` })
     }
   })
+
+  if (isNight && viability.sunriseIsLaterToday) {
+    const dayMatch = combined.match(WRONG_DAY_REFERENCE_PATTERN)
+    if (dayMatch) {
+      issues.push({ code: 'wrong_day_reference', detail: `Report says "${dayMatch[0]}" but it's early morning — sunrise is later today (~${viability.riseStr})` })
+    }
+  }
 
   if (windDescription) {
     const groundTruthOffshore = /\boffshore\b/i.test(windDescription) && !/\bonshore\b/i.test(windDescription)
@@ -276,7 +296,7 @@ function localDateKey(date: Date, timezone: string): string {
   return date.toLocaleDateString('en-CA', { timeZone: timezone })
 }
 
-type SessionViability =
+export type SessionViability =
   | { viable: true }
   | { viable: false; reason: 'night'; riseStr: string; minutesToRise: number; isPreDawn: boolean; sunriseIsLaterToday: boolean }
   | { viable: false; reason: 'lightning' }
@@ -284,7 +304,7 @@ type SessionViability =
 // Within this many minutes of sunrise, it's "pre-dawn" (sky lightening) rather than "the middle of the night"
 const PRE_DAWN_WINDOW_MINUTES = 90
 
-function getSessionViability(now: Date, lat: number, lon: number, timezone: string, weatherDescription: string): SessionViability {
+export function getSessionViability(now: Date, lat: number, lon: number, timezone: string, weatherDescription: string): SessionViability {
   if (/thunder|lightning|tropical storm|hurricane/i.test(weatherDescription)) {
     return { viable: false, reason: 'lightning' }
   }
@@ -505,7 +525,7 @@ export function createDetailedSurfPrompt(surfData: any, ctx: LocationContext, no
     ? 'Surfable now'
     : viability.reason === 'lightning'
       ? 'NOT SURFABLE — thunderstorm/lightning activity'
-      : `NOT SURFABLE NOW — ${viability.isPreDawn ? 'pre-dawn, still dark' : 'nighttime'} (light returns ~${viability.riseStr})`
+      : `NOT SURFABLE NOW — ${viability.isPreDawn ? 'pre-dawn, still dark' : viability.sunriseIsLaterToday ? 'early morning, still dark' : 'nighttime'} (light returns ~${viability.riseStr})`
 
   const viabilityInstructions = viability.viable ? '' : viability.reason === 'lightning'
     ? `
@@ -529,11 +549,11 @@ It is currently pre-dawn (still dark, but sunrise is only ~${viability.minutesTo
 - timingAdvice: reference ${viability.riseStr} specifically, not a vague "check back later".`
         : `
 IMPORTANT — TIMING OVERRIDE:
-It is currently nighttime — too dark to surf. Sunrise is ${checkBackPhrase}.
+It is currently ${viability.sunriseIsLaterToday ? 'early morning, before first light' : 'nighttime'} — too dark to surf. Sunrise is ${checkBackPhrase}.
 - Do NOT attempt to describe or predict conditions once it's light — you have no forecast data, only a current snapshot that may not hold once the sun's up.
 - Do not explain or dwell on why surfing isn't happening right now (nobody's out, waiting for a wave that's not coming, etc.) — that's self-evident. State it in passing and move on.
 - Paragraph 1 is the ONLY place to describe conditions: one concise read of the current snapshot (size, wind, tide). Do not repeat this assessment in paragraph 2.
-- Paragraph 2: one short line pointing to ${checkBackPhrase} for an accurate read. Don't restate the conditions you just gave, and don't claim they'll "look promising" or "hold" — you don't know that yet. Never say "tomorrow" — sunrise is ${viability.sunriseIsLaterToday ? 'later today' : 'tomorrow'}, say so correctly.
+- Paragraph 2: one short line pointing to ${checkBackPhrase} for an accurate read. Don't restate the conditions you just gave, and don't claim they'll "look promising" or "hold" — you don't know that yet.${viability.sunriseIsLaterToday ? ' It is already past midnight: never say "tonight" or "tomorrow" — the next light is later today.' : ''}
 - timingAdvice: reference ${viability.riseStr} and whether that's later today or tomorrow morning — not a bare "check back tomorrow".`
       })()
 
@@ -648,6 +668,7 @@ export async function generateDetailedSurfReport(surfData: any, ctx: LocationCon
   // Same string the prompt shows as Local Date, so the gate and the prompt agree on
   // what "today" is even across a timezone or DST boundary.
   const localDate = getLocalTime(ctx.timezone, now).date
+  const viability = getSessionViability(now, ctx.lat, ctx.lon, ctx.timezone, surfData.weather.weather_description)
 
   let lastIssues: ReportValidationIssue[] = []
   let lastError: unknown = null
@@ -674,7 +695,8 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
       const issues = validateReportText(
         [aiResponse.conditionsAnalysis, aiResponse.recommendationsAndOutlook],
         windDescription,
-        localDate
+        localDate,
+        viability
       )
 
       if (issues.length > 0) {
@@ -726,7 +748,6 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
   )
 
   const windMph = Math.round(surfData.details.wind_speed_kts * 1.15078)
-  const viability = getSessionViability(now, ctx.lat, ctx.lon, ctx.timezone, surfData.weather.weather_description)
   const fallbackReport = createEnhancedFallbackReport(surfData, windMph, ctx, viability)
 
   return {

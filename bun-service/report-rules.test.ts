@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { validateReportText } from './index'
+import { getSessionViability, validateReportText } from './index'
 
 // validateReportText also enforces a 25-130 word range per paragraph, so every fixture
 // is padded to a realistic length — otherwise a word_count issue masks what's under test.
@@ -96,5 +96,65 @@ describe('wrong_date — the named weekday must match Local Date', () => {
   it('allows a forward-looking seasonal reference by month', () => {
     expect(codesFor('Come back when the nor\'easters start rolling in September.', FRIDAY))
       .not.toContain('wrong_date')
+  })
+})
+
+// St. Augustine on Oct 15, 2026 — sunrise ~7:25 AM EDT. The 5:07 AM cron run is the one
+// that shipped "no surfing tonight ... check back tomorrow".
+const ST_AUG = { lat: 29.8946, lon: -81.3145, tz: 'America/New_York' }
+const viabilityAt = (iso: string) => getSessionViability(new Date(iso), ST_AUG.lat, ST_AUG.lon, ST_AUG.tz, 'Clear sky')
+const EARLY_MORNING = viabilityAt('2026-10-15T09:07:00Z') // 5:07 AM EDT
+const LATE_EVENING = viabilityAt('2026-10-15T02:30:00Z')  // 10:30 PM EDT the night before
+const DAYTIME = viabilityAt('2026-10-15T16:00:00Z')       // noon EDT
+const SNAPSHOT = 'Too dark to surf right now. Current snapshot: knee to waist high, light east wind, falling tide.'
+
+describe('wrong_day_reference — before sunrise, the next light is later today', () => {
+  it('classifies 5:07 AM as night with sunrise later today', () => {
+    expect(EARLY_MORNING).toMatchObject({ viable: false, reason: 'night', sunriseIsLaterToday: true })
+  })
+
+  it.each([
+    'No surfing tonight at St. Augustine.',
+    'Check back tomorrow for an accurate read.',
+  ])('rejects %p in the early morning', text => {
+    expect(validateReportText([SNAPSHOT, text], null, null, EARLY_MORNING).map(i => i.code))
+      .toContain('wrong_day_reference')
+  })
+
+  it('allows "tonight" and "tomorrow" before midnight', () => {
+    expect(LATE_EVENING).toMatchObject({ viable: false, reason: 'night', sunriseIsLaterToday: false })
+    expect(validateReportText([SNAPSHOT, 'Check back tomorrow morning around 7:25 AM.'], null, null, LATE_EVENING).map(i => i.code))
+      .not.toContain('wrong_day_reference')
+  })
+})
+
+describe('word_count — night reports are terse by design', () => {
+  const SHORT_P2 = 'Check back later this morning, around 7:25 AM, for an accurate read.'
+
+  it('accepts a one-line paragraph 2 at night', () => {
+    expect(validateReportText([SNAPSHOT, SHORT_P2], null, null, EARLY_MORNING).map(i => i.code))
+      .not.toContain('word_count')
+  })
+
+  it('still holds a daytime report to the 25-word floor', () => {
+    expect(DAYTIME).toEqual({ viable: true })
+    expect(validateReportText([SNAPSHOT, SHORT_P2], null, null, DAYTIME).map(i => i.code))
+      .toContain('word_count')
+  })
+})
+
+describe('fabricated_crowd_count — "head out" is a verb, not a headcount', () => {
+  it.each([
+    'Head out once it is light, around 7:25 AM.',
+    'If you have time, head out before the sun drops.',
+  ])('allows %p', text => {
+    expect(codesFor(text)).not.toContain('fabricated_crowd_count')
+  })
+
+  it.each([
+    'You will find maybe half a dozen heads out right now.',
+    'There are a few heads in the water already.',
+  ])('still rejects %p', text => {
+    expect(codesFor(text)).toContain('fabricated_crowd_count')
   })
 })

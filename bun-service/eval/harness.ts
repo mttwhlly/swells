@@ -10,7 +10,7 @@
 //      re-checked on every run so it can't silently regress.
 // Exits non-zero on any failure so this can run as a CI gate, not just by hand.
 
-import { generateDetailedSurfReport, validateReportText, findStockPhrases, type LocationContext } from '../index'
+import { generateDetailedSurfReport, getSessionViability, validateReportText, findStockPhrases, type LocationContext } from '../index'
 
 interface MockConditions {
   wave_height_ft: number
@@ -291,12 +291,13 @@ async function runOne(label: string, slug: string, locationName: string, ctx: Lo
   log()
   log(result.report)
 
-  // Same three arguments generateDetailedSurfReport passes, so the harness re-checks
+  // Same arguments generateDetailedSurfReport passes, so the harness re-checks
   // exactly what production gated on — including the weekday rule, which is inert
   // without a Local Date.
   const localDate = new Date(now.toLocaleString('en-US', { timeZone: ctx.timezone }))
     .toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
-  const issues = validateReportText(result.report.split('\n\n'), surfData.details.wind_direction_description ?? null, localDate)
+  const viability = getSessionViability(now, ctx.lat, ctx.lon, ctx.timezone, surfData.weather.weather_description)
+  const issues = validateReportText(result.report.split('\n\n'), surfData.details.wind_direction_description ?? null, localDate, viability)
   if (issues.length > 0) {
     log()
     log(`⚠️ VALIDATION FAILED: ${issues.map(i => i.detail).join('; ')}`)
