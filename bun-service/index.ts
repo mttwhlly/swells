@@ -1,6 +1,6 @@
 import { serve } from "bun"
 import { generateObject } from 'ai'
-import { anthropic } from '@ai-sdk/anthropic'
+import { createAnthropic } from '@ai-sdk/anthropic'
 import { openai } from '@ai-sdk/openai'
 import { z } from 'zod'
 
@@ -655,8 +655,30 @@ function reportConditions(surfData: any) {
 // so a single provider outage doesn't drop straight to the hardcoded template. Each
 // tier's output is schema-validated by generateObject AND fact-checked by
 // validateReportText — either failure moves to the next tier.
+//
+// Claude Haiku 5.5 rejects `temperature` outright ("`temperature` is deprecated for this
+// model"), and AI SDK v4 can't omit it — prepareCallSettings turns an unset temperature
+// into 0 and sends it anyway. Left in, every primary call 400s and all traffic silently
+// lands on the secondary (the eval still passes, so this is easy to miss). Strip it from
+// the request body instead. Remove this once the SDK is on v5+, which no longer defaults it.
+//
+// The same wrapper turns on strict tool use, which v4 has no option for. Without it Haiku 5.5
+// intermittently leaks tool-call markup into the nested object — `recommendations` arrived
+// as the string "\n<parameter name=\"boardType\">funboard" in 2 of 10 eval reports —
+// failing schema validation and costing the tier. Strict guarantees the input matches.
+const anthropic = createAnthropic({
+  fetch: async (url, init) => {
+    if (typeof init?.body === 'string') {
+      const { temperature: _temperature, ...body } = JSON.parse(init.body)
+      for (const tool of body.tools ?? []) tool.strict = true
+      init = { ...init, body: JSON.stringify(body) }
+    }
+    return fetch(url, init)
+  },
+})
+
 const MODEL_TIERS = [
-  { backend: 'anthropic-primary', modelId: 'claude-haiku-4-5-20251001', model: anthropic('claude-haiku-4-5-20251001') },
+  { backend: 'anthropic-primary', modelId: 'claude-haiku-5-5', model: anthropic('claude-haiku-5-5') },
   { backend: 'openai-secondary', modelId: 'gpt-4o-mini', model: openai('gpt-4o-mini') },
 ] as const
 

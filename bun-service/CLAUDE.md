@@ -20,7 +20,7 @@ bun start    # production run
 
 Single-file service (`index.ts`) deployed as a Docker container on Coolify. Receives a cron trigger, fetches surf data from the Next.js app, generates an AI report, and saves the result back to the Next.js app.
 
-**Model fallback ladder** (`generateDetailedSurfReport`, `MODEL_TIERS`): Claude Haiku (`@ai-sdk/anthropic`) is primary; if it errors, or its output fails `validateReportText` (banned openers, word-count sanity, contradicting the wind onshore/offshore ground truth, inventing a crowd count, leaning on a gated stock phrase, quoting the surf size in feet, restating the spot's cardinal orientation, or naming a weekday that isn't today's), the prompt is retried against OpenAI `gpt-4o-mini` (`@ai-sdk/openai`) as a secondary model.
+**Model fallback ladder** (`generateDetailedSurfReport`, `MODEL_TIERS`): Claude Haiku 5.5 (`claude-haiku-5-5`, `@ai-sdk/anthropic`) is primary — it rejects `temperature`, which AI SDK v4 always sends, so its provider's `fetch` strips the field (and turns on strict tool use, which v4 can't, after Haiku 5.5 leaked tool-call markup into the nested `recommendations` object); if it errors, or its output fails `validateReportText` (banned openers, word-count sanity, contradicting the wind onshore/offshore ground truth, inventing a crowd count, leaning on a gated stock phrase, quoting the surf size in feet, restating the spot's cardinal orientation, or naming a weekday that isn't today's), the prompt is retried against OpenAI `gpt-4o-mini` (`@ai-sdk/openai`) as a secondary model.
 
 The retry prompt is **not** byte-identical to the first: the previous tier's `validateReportText` issues are appended to it. Retrying unchanged wastes the tier — the second model can't know why the first was rejected and independently trips the same rule. Observed before this was added: Haiku's `"get your feet wet"` was followed by gpt-4o-mini's `"quick and choppy"`, dropping a report to the deterministic template. If both tiers fail, `createEnhancedFallbackReport` produces a deterministic, non-AI template from the same surf data. `generation_meta.backend` on the returned report records which tier actually won (`anthropic-primary` / `openai-secondary` / `bun-fallback`).
 
@@ -98,7 +98,7 @@ Docker on Coolify. Set the **Base Directory** in Coolify source settings to `/bu
 ## Environment Variables
 
 ```
-ANTHROPIC_API_KEY  # Primary model (Claude Haiku)
+ANTHROPIC_API_KEY  # Primary model (Claude Haiku 5.5)
 OPENAI_API_KEY     # Secondary model (gpt-4o-mini), used only if Anthropic fails or is rejected by validation
 API_SECRET         # Shared secret for /generate-surf-report
 CRON_SECRET        # Shared secret for /cron/generate-fresh-report
