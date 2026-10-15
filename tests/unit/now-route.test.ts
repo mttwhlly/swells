@@ -94,16 +94,32 @@ describe('GET /api/now', () => {
     expect(res.headers.get('vary')).toBe('Origin');
   });
 
-  it('allows the local portfolio dev server', async () => {
-    mockGetCachedReport.mockResolvedValue(report(1));
-    const res = await GET(request('http://localhost:4321'));
-    expect(res.headers.get('access-control-allow-origin')).toBe('http://localhost:4321');
-  });
+  it.each(['http://localhost:4321', 'http://localhost:4322', 'http://127.0.0.1:4321', 'http://localhost:3000'])(
+    'allows the local dev server at %s',
+    async (origin) => {
+      mockGetCachedReport.mockResolvedValue(report(1));
+      const res = await GET(request(origin));
+      expect(res.headers.get('access-control-allow-origin')).toBe(origin);
+      expect(res.headers.get('vary')).toBe('Origin');
+    }
+  );
 
-  it('sends no CORS header to other origins', async () => {
+  it.each([
+    'https://evil.example',
+    'https://mattwhalley.com.evil.example',
+    'https://www.mattwhalley.com',
+    'http://mattwhalley.com',
+    'https://localhost:4321',
+    'http://localhost',
+    'http://localhost:4321.evil.example',
+    'http://localhost.evil.example:4321',
+    'http://127.0.0.2:4321',
+    'null',
+  ])('sends no CORS header to %s', async (origin) => {
     mockGetCachedReport.mockResolvedValue(report(1));
-    const res = await GET(request('https://evil.example'));
+    const res = await GET(request(origin));
     expect(res.headers.get('access-control-allow-origin')).toBeNull();
+    expect(res.headers.get('vary')).toBe('Origin');
   });
 
   it.each([

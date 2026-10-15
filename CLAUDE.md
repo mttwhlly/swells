@@ -64,7 +64,7 @@ Browser → /api/surf-report (GET)
 
 ### Public status endpoint (`/api/now`)
 
-`GET /api/now` returns `{ status, updatedAt }` for St. Augustine — a 2–5 word phrase ("clean and waist-high") that mattwhalley.com drops into its About line. It reads only the latest stored row (`getCachedReport`) and maps its `conditions` deterministically (`src/app/lib/surfStatus.ts`), so it never fetches upstream or triggers a generation. Rows older than 6 hours, a missing row (the cron deletes before regenerating) or a DB error return `200 { "status": null }`; with the last cron at 4pm ET that means `null` from about 10pm to 5am ET. CORS allows only `https://mattwhalley.com` and `http://localhost:4321`, which is why `next.config.js`'s `/api/*` wildcard rule excludes it. Edge-cached 20 minutes (`s-maxage`), 5 minutes for `null`.
+`GET /api/now` returns `{ status, updatedAt }` for St. Augustine — a 2–5 word phrase ("clean and waist-high") that mattwhalley.com drops into its About line. It reads only the latest stored row (`getCachedReport`) and maps its `conditions` deterministically (`src/app/lib/surfStatus.ts`), so it never fetches upstream or triggers a generation. Rows older than 6 hours, a missing row (the cron deletes before regenerating) or a DB error return `200 { "status": null }`; with the last cron at 4pm ET that means `null` from about 10pm to 5am ET. CORS echoes the origin only for `https://mattwhalley.com` and `http://localhost:<port>` / `http://127.0.0.1:<port>` (any port), with `Vary: Origin` so the edge cache keys on it — which is why `next.config.js`'s `/api/*` wildcard rule excludes it. Edge-cached 20 minutes (`s-maxage`), 5 minutes for `null`.
 
 ### Key architectural decision: Bun AI service
 

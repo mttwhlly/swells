@@ -10,7 +10,9 @@ export const dynamic = 'force-dynamic';
 // Bun call — so portfolio traffic can never trigger a generation. Excluded from the
 // `/api/*` wildcard CORS rule in next.config.js; it allows only these origins.
 const SLUG = 'st-augustine';
-const ALLOWED_ORIGINS = new Set(['https://mattwhalley.com', 'http://localhost:4321']);
+const PRODUCTION_ORIGIN = 'https://mattwhalley.com';
+// Any local dev server port, so the portfolio works on whatever port its dev server picks.
+const LOCAL_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/;
 const MAX_AGE_HOURS = 6;
 
 // Short edge TTL for nulls: the cron deletes rows before regenerating them, and a null
@@ -22,7 +24,7 @@ function corsHeaders(request: NextRequest): Record<string, string> {
   const origin = request.headers.get('origin');
   return {
     Vary: 'Origin',
-    ...(origin && ALLOWED_ORIGINS.has(origin) && {
+    ...(origin && (origin === PRODUCTION_ORIGIN || LOCAL_ORIGIN.test(origin)) && {
       'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
     }),
