@@ -28,7 +28,7 @@ bun dev           # Hot-reload dev server
 
 Baseline suite covering the golden paths: home page, a `[slug]` location page, `/api/surf-report` (cache-hit and cache-miss), `/api/og`.
 
-- **Vitest** (`tests/unit/`) tests route-handler logic in isolation — `@/lib/db` and `fetch` are mocked, so no real DB/network calls happen. Also covers the coast-orientation scoring, the Hs→body-scale conversion, session viability (day/night/lightning), and the local fallback template at 5am, 10:30pm, in daylight and in a thunderstorm.
+- **Vitest** (`tests/unit/`) tests route-handler logic in isolation — `@/lib/db` and `fetch` are mocked, so no real DB/network calls happen. Also covers the coast-orientation scoring, the `/api/now` status phrase and its CORS/cache headers, the Hs→body-scale conversion, session viability (day/night/lightning), and the local fallback template at 5am, 10:30pm, in daylight and in a thunderstorm.
 - **`bun test`** (from `bun-service/`) covers `waveSizeOf`, `getSessionViability`, the report-validation gates and the eval's win-rate gate. Offline — it calls no models, unlike `bun run eval`.
 - **Playwright** (`tests/e2e/`) drives a real `pnpm dev` server in a browser. The `/api/surf-report` client fetch is intercepted with `page.route` to avoid exercising the live generation chain (surfability → Bun AI service → DB write); server-side reads of the DB cache (in `[slug]/page.tsx`) are real, so `.env.local` must be present locally. Not wired into CI yet.
 - `/api/og`'s e2e test is `test.fixme()` — the route currently crashes on every request in dev (tracked in [#36](https://github.com/mttwhlly/swells/issues/36)), pre-existing and unrelated to any of this repo's other in-flight work.
@@ -61,6 +61,10 @@ Browser → /api/surf-report (GET)
 ```
 
 **Cron job** (`/api/admin/request-forecast`, 4× daily): clears the DB cache, then calls the Bun service to pre-generate a fresh report so user requests are always served from cache.
+
+### Public status endpoint (`/api/now`)
+
+`GET /api/now` returns `{ status, updatedAt }` for St. Augustine — a 2–5 word phrase ("clean and waist-high") that mattwhalley.com drops into its About line. It reads only the latest stored row (`getCachedReport`) and maps its `conditions` deterministically (`src/app/lib/surfStatus.ts`), so it never fetches upstream or triggers a generation. Rows older than 6 hours, a missing row (the cron deletes before regenerating) or a DB error return `200 { "status": null }`; with the last cron at 4pm ET that means `null` from about 10pm to 5am ET. CORS allows only `https://mattwhalley.com` and `http://localhost:4321`, which is why `next.config.js`'s `/api/*` wildcard rule excludes it. Edge-cached 20 minutes (`s-maxage`), 5 minutes for `null`.
 
 ### Key architectural decision: Bun AI service
 

@@ -21,7 +21,8 @@ const nextConfig = {
   // Enhanced headers for CORS and security
   headers: async () => [
     {
-      source: '/api/:path*',
+      // /api/now sets its own origin allowlist (see its route).
+      source: '/api/:path((?!now$).*)',
       headers: [
         { key: 'Access-Control-Allow-Origin', value: '*' },
         { key: 'Access-Control-Allow-Methods', value: 'GET, POST, OPTIONS' },

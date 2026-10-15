@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getLocation, DEFAULT_LOCATION_SLUG } from '@/lib/locations';
 import { describeWaveSize } from '@/lib/waveSize';
+import { isOffshoreWind } from '@/lib/wind';
 
 export const dynamic = 'force-dynamic';
 
@@ -74,14 +75,6 @@ function degreesToCompass(degrees: number): string {
   ];
   const index = Math.round(degrees / 22.5) % 16;
   return directions[index];
-}
-
-// Generic: is wind offshore for this coast orientation?
-function isOffshoreWind(windDirection: number, coastFacingDeg: number): boolean {
-  const offshoreCenter = (coastFacingDeg + 180) % 360;
-  let diff = Math.abs(windDirection - offshoreCenter);
-  if (diff > 180) diff = 360 - diff;
-  return diff <= 90;
 }
 
 function getWindDescription(windDirection: number, windSpeed: number, coastFacingDeg: number): string {
