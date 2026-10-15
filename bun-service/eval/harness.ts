@@ -10,7 +10,8 @@
 //      re-checked on every run so it can't silently regress.
 // Exits non-zero on any failure so this can run as a CI gate, not just by hand.
 
-import { generateDetailedSurfReport, getSessionViability, validateReportText, findStockPhrases, isConfigurationError, MODEL_TIERS, type LocationContext } from '../index'
+import { generateDetailedSurfReport, getSessionViability, validateReportText, findStockPhrases, findWrongDayReference, isConfigurationError, MODEL_TIERS, type LocationContext } from '../index'
+import { tierWinRate, FIRST_TIER_MAX_LOSS_SHARE, type ReportOutcome } from './win-rate'
 
 // EVAL_TIERS=openai-secondary runs every scenario on that tier alone. The secondary only
 // writes a report when the primary fails, so a normal run barely exercises it — this is how
@@ -203,8 +204,13 @@ const CROSS_LOCATION_CONTEXTS: Array<{ slug: string; ctx: LocationContext }> = [
 const ST_AUGUSTINE_CTX = CROSS_LOCATION_CONTEXTS[0]!.ctx
 
 // Fixed UTC instants so day/night is deterministic regardless of when the harness runs.
-const DAYTIME_NOW = new Date('2026-08-28T18:00:00Z')  // ~2pm EDT / 11am PDT
-const NIGHT_NOW = new Date('2026-08-28T06:00:00Z')     // ~2am EDT — before sunrise
+// Sunrise at St. Augustine on these dates is ~6:59 AM EDT. Each night instant is also a row
+// in session-viability.test.ts, so the class it's meant to exercise can't drift unnoticed.
+const DAYTIME_NOW = new Date('2026-08-28T18:00:00Z')        // ~2pm EDT / 11am PDT
+const NIGHT_NOW = new Date('2026-08-28T06:00:00Z')           // ~2am EDT — past midnight, long before sunrise
+const EARLY_MORNING_NOW = new Date('2026-08-28T09:00:00Z')   // ~5am EDT — past midnight, outside the pre-dawn window
+const PRE_DAWN_NOW = new Date('2026-08-28T10:15:00Z')        // ~6:15am EDT — inside the 90-minute pre-dawn window
+const LATE_EVENING_NOW = new Date('2026-08-28T02:30:00Z')    // ~10:30pm EDT the evening before — before midnight
 
 const lines: string[] = []
 function log(s: string = '') {
@@ -244,6 +250,12 @@ const stockPhraseHits: Array<{ label: string; hits: string[] }> = []
 // Every report this run, for the variety metrics below.
 const allReports: Array<{ label: string; text: string }> = []
 const fallbackLabels = new Set<string>()
+const outcomes: ReportOutcome[] = []
+
+// recommendations.timing_advice isn't shown anywhere in the app today (no component, the
+// audio narration or push reads it), so it isn't gated — a rejection would cost a tier for
+// an invisible field. Monitored instead, so the data exists if it's ever surfaced.
+const timingAdviceWrongDay: Array<{ label: string; advice: string; word: string }> = []
 
 // Latency and tokens of each report's winning model call — the numbers a model or
 // reasoning-effort change trades against quality.
@@ -314,6 +326,14 @@ async function runOne(label: string, slug: string, locationName: string, ctx: Lo
     .toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
   const viability = getSessionViability(now, ctx.lat, ctx.lon, ctx.timezone, surfData.weather.weather_description)
   const issues = validateReportText(result.report.split('\n\n'), surfData.details.wind_direction_description ?? null, localDate, viability)
+  outcomes.push(result.generation_meta)
+  const timingAdvice = result.recommendations.timing_advice ?? ''
+  const timingWord = findWrongDayReference(timingAdvice, viability)
+  if (timingWord) {
+    timingAdviceWrongDay.push({ label, advice: timingAdvice, word: timingWord })
+    log()
+    log(`📉 TIMING ADVICE says "${timingWord}" before sunrise: "${timingAdvice}"`)
+  }
   if (issues.length > 0) {
     log()
     log(`⚠️ VALIDATION FAILED: ${issues.map(i => i.detail).join('; ')}`)
@@ -394,6 +414,12 @@ async function main() {
   header('EDGE CASES')
   await runOne('Normal daytime, good conditions', 'st-augustine', ST_AUGUSTINE_CTX.locationName, ST_AUGUSTINE_CTX, GOOD_DAY, DAYTIME_NOW)
   await runOne('Night (before sunrise)', 'st-augustine', ST_AUGUSTINE_CTX.locationName, ST_AUGUSTINE_CTX, MEDIOCRE, NIGHT_NOW)
+  // The production failure: the 5:07 AM report said "no surfing tonight ... check back
+  // tomorrow" with sunrise later that morning. wrong_day_reference gates it.
+  await runOne('Night, ~5am (past midnight, before the pre-dawn window)', 'st-augustine', ST_AUGUSTINE_CTX.locationName, ST_AUGUSTINE_CTX, MEDIOCRE, EARLY_MORNING_NOW)
+  await runOne('Pre-dawn, ~6:15am (inside the 90-minute window)', 'st-augustine', ST_AUGUSTINE_CTX.locationName, ST_AUGUSTINE_CTX, MEDIOCRE, PRE_DAWN_NOW)
+  // Before midnight "tomorrow morning" is correct, and the gate must leave it alone.
+  await runOne('Night, ~10:30pm (before midnight)', 'st-augustine', ST_AUGUSTINE_CTX.locationName, ST_AUGUSTINE_CTX, MEDIOCRE, LATE_EVENING_NOW)
   await runOne('Lightning / thunderstorm override', 'st-augustine', ST_AUGUSTINE_CTX.locationName, ST_AUGUSTINE_CTX, LIGHTNING, DAYTIME_NOW)
 
   header('BUG REPRO: NE wind at St. Augustine must be called onshore, not offshore')
@@ -429,6 +455,25 @@ async function main() {
     log(`  latency: p50 ${sorted[Math.floor(sorted.length / 2)]}ms, mean ${mean(sorted)}ms, max ${sorted[sorted.length - 1]}ms`)
     log(`  output tokens: mean ${mean(callCosts.map(c => c.outputTokens))} (of which reasoning: mean ${mean(callCosts.map(c => c.reasoningTokens))})`)
   }
+
+  header('TIER WIN RATE')
+  const winRate = tierWinRate(outcomes, TIERS[0]!.backend)
+  for (const [backend, n] of [...winRate.wins.entries()].sort((a, b) => b[1] - a[1])) {
+    log(`  ${String(n).padStart(3)}/${winRate.reports}  ${backend}`)
+  }
+  if (winRate.lossReasons.length > 0) {
+    log(`  why ${winRate.firstTier} lost:`)
+    for (const reason of winRate.lossReasons) log(`    - ${reason}`)
+  }
+  if (winRate.failed) {
+    const msg = `${winRate.firstTier} lost ${winRate.lossReasons.length}/${winRate.reports} reports (fails at ${FIRST_TIER_MAX_LOSS_SHARE * 100}% or more)`
+    log(`⚠️ ${msg}`)
+    failures.push(msg)
+  }
+
+  header('TIMING ADVICE (monitored, not gated)')
+  log(`  ${timingAdviceWrongDay.length} report(s) said "tonight"/"tomorrow" in timing_advice before sunrise`)
+  for (const t of timingAdviceWrongDay) log(`    ${t.label}: "${t.advice}"`)
 
   header('STOCK PHRASE COMPLIANCE')
   const totalHits = stockPhraseHits.reduce((n, r) => n + r.hits.length, 0)

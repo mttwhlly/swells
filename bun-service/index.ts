@@ -133,7 +133,13 @@ const NIGHT_MIN_PARAGRAPH_WORDS = 8
 
 // Between local midnight and sunrise, the next light is *later today*. "Tonight" and
 // "tomorrow" are both wrong then, and the prompt saying so was not enough on its own.
+// Before midnight both are right, so this only ever applies once the date has turned over.
 const WRONG_DAY_REFERENCE_PATTERN = /\b(tonight|tomorrow)\b/i
+
+export function findWrongDayReference(text: string, viability: SessionViability | null): string | null {
+  if (viability === null || viability.viable || viability.reason !== 'night' || !viability.sunriseIsLaterToday) return null
+  return text.match(WRONG_DAY_REFERENCE_PATTERN)?.[0] ?? null
+}
 
 export function validateReportText(
   paragraphs: string[],
@@ -158,11 +164,9 @@ export function validateReportText(
     }
   })
 
-  if (isNight && viability.sunriseIsLaterToday) {
-    const dayMatch = combined.match(WRONG_DAY_REFERENCE_PATTERN)
-    if (dayMatch) {
-      issues.push({ code: 'wrong_day_reference', detail: `Report says "${dayMatch[0]}" but it's early morning — sunrise is later today (~${viability.riseStr})` })
-    }
+  const wrongDay = findWrongDayReference(combined, viability)
+  if (wrongDay && isNight) {
+    issues.push({ code: 'wrong_day_reference', detail: `Report says "${wrongDay}" but it's early morning — sunrise is later today (~${viability.riseStr})` })
   }
 
   if (windDescription) {
@@ -675,9 +679,16 @@ function reportConditions(surfData: any) {
 //   The secondary mostly runs inside the cron, and often to repair a rejected primary
 //   report, so following instructions is worth more than the latency. Reasoning counts
 //   toward maxOutputTokens, hence the larger budget; summaries are never read.
+//
+// Every tier has a hard timeout (it covers the SDK's own retries). Without one, a request
+// that never answers holds the whole ladder — and the cron run — open indefinitely instead
+// of falling through: an eval run sat for 12 minutes on a gpt-6-luna call that never
+// returned. 20s is 2-3x the slowest call observed on either tier.
+const TIER_TIMEOUT_MS = 20_000
+
 type GenerateTextOptions = Parameters<typeof generateText>[0]
 
-export interface ModelTier extends Pick<GenerateTextOptions, 'maxOutputTokens' | 'reasoning' | 'providerOptions'> {
+export interface ModelTier extends Pick<GenerateTextOptions, 'maxOutputTokens' | 'reasoning' | 'providerOptions' | 'timeout'> {
   backend: string
   modelId: string
   model: LanguageModel
@@ -690,6 +701,7 @@ export const MODEL_TIERS: readonly ModelTier[] = [
     model: anthropic('claude-haiku-5-5'),
     maxOutputTokens: 800,
     reasoning: 'none',
+    timeout: { totalMs: TIER_TIMEOUT_MS },
   },
   {
     backend: 'openai-secondary',
@@ -698,6 +710,7 @@ export const MODEL_TIERS: readonly ModelTier[] = [
     maxOutputTokens: 2000,
     reasoning: 'low',
     providerOptions: { openai: { reasoningSummary: null } },
+    timeout: { totalMs: TIER_TIMEOUT_MS },
   },
 ]
 
@@ -706,6 +719,7 @@ export const MODEL_TIERS: readonly ModelTier[] = [
 // hides it in production by falling through to the next tier, so it's recorded here for the
 // eval harness to fail on. Both model upgrades hit exactly this and still passed the eval.
 export interface TierError { backend: string; status: number | null; message: string }
+export interface TierRejection { backend: string; issues: ReportValidationIssue[] }
 
 // A retryable failure (429/5xx) that exhausts the SDK's retries arrives wrapped in a
 // RetryError, which carries no status of its own — read it off the last attempt.
@@ -737,6 +751,9 @@ export async function generateDetailedSurfReport(
   let lastIssues: ReportValidationIssue[] = []
   let lastError: unknown = null
   const tierErrors: TierError[] = []
+  // Tiers that answered but failed validateReportText. Together with tierErrors this says
+  // why every tier ahead of the winner lost — which the eval reports as the win rate.
+  const tierRejections: TierRejection[] = []
 
   for (const tier of tiers) {
     try {
@@ -757,6 +774,7 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
         maxOutputTokens: tier.maxOutputTokens,
         reasoning: tier.reasoning,
         providerOptions: tier.providerOptions,
+        timeout: tier.timeout,
       })
 
       const issues = validateReportText(
@@ -769,6 +787,7 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
       if (issues.length > 0) {
         console.warn(`⚠️ ${tier.backend} output failed validation for ${ctx.locationName}: ${issues.map(i => i.detail).join('; ')}`)
         lastIssues = issues
+        tierRejections.push({ backend: tier.backend, issues })
         continue
       }
 
@@ -798,6 +817,7 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
           prompt_version: '3.3',
           validation_issues: [] as string[],
           tier_errors: tierErrors,
+          tier_rejections: tierRejections,
           // The winning call only — what this report cost, not what the ladder did to get here.
           latency_ms: Date.now() - startedAt,
           input_tokens: usage.inputTokens,
@@ -849,6 +869,7 @@ ${lastIssues.map(i => `- ${i.detail}`).join('\n')}`
       prompt_version: '3.3',
       validation_issues: lastIssues.map(i => i.detail),
       tier_errors: tierErrors,
+      tier_rejections: tierRejections,
     }
   }
 }

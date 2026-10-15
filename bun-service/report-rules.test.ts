@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
-import { getSessionViability, validateReportText } from './index'
+import { findWrongDayReference, getSessionViability, validateReportText, type TierError, type TierRejection } from './index'
+import { tierWinRate } from './eval/win-rate'
 
 // validateReportText also enforces a 25-130 word range per paragraph, so every fixture
 // is padded to a realistic length — otherwise a word_count issue masks what's under test.
@@ -121,6 +122,19 @@ describe('wrong_day_reference — before sunrise, the next light is later today'
       .toContain('wrong_day_reference')
   })
 
+  // Pre-dawn is also past midnight — sunrise is under 90 minutes away, later today.
+  it('rejects "tomorrow" inside the pre-dawn window', () => {
+    const PRE_DAWN = viabilityAt('2026-10-15T10:30:00Z') // 6:30 AM EDT
+    expect(PRE_DAWN).toMatchObject({ viable: false, reason: 'night', isPreDawn: true, sunriseIsLaterToday: true })
+    expect(validateReportText([SNAPSHOT, 'Check back tomorrow once it is light.'], null, null, PRE_DAWN).map(i => i.code))
+      .toContain('wrong_day_reference')
+  })
+
+  it('allows "later this morning" in the early morning', () => {
+    expect(validateReportText([SNAPSHOT, 'Check back later this morning, around 7:25 AM.'], null, null, EARLY_MORNING).map(i => i.code))
+      .not.toContain('wrong_day_reference')
+  })
+
   it('allows "tonight" and "tomorrow" before midnight', () => {
     expect(LATE_EVENING).toMatchObject({ viable: false, reason: 'night', sunriseIsLaterToday: false })
     expect(validateReportText([SNAPSHOT, 'Check back tomorrow morning around 7:25 AM.'], null, null, LATE_EVENING).map(i => i.code))
@@ -156,5 +170,57 @@ describe('fabricated_crowd_count — "head out" is a verb, not a headcount', () 
     'There are a few heads in the water already.',
   ])('still rejects %p', text => {
     expect(codesFor(text)).toContain('fabricated_crowd_count')
+  })
+})
+
+// recommendations.timing_advice isn't rendered anywhere, so the harness only monitors it —
+// but with the same finder the prose gate uses, so the two can't disagree.
+describe('findWrongDayReference — applied to timing_advice', () => {
+  it('flags "tomorrow" at 5am', () => {
+    expect(findWrongDayReference('Check back tomorrow morning (~7:25 AM) for an accurate read.', EARLY_MORNING)).toBe('tomorrow')
+  })
+
+  it('leaves "tomorrow" alone before midnight', () => {
+    expect(findWrongDayReference('Check back tomorrow morning (~7:25 AM) for an accurate read.', LATE_EVENING)).toBeNull()
+  })
+
+  it('leaves daytime and lightning advice alone', () => {
+    expect(findWrongDayReference('Surf tomorrow if the swell holds.', DAYTIME)).toBeNull()
+    expect(findWrongDayReference('Wait until tomorrow.', { viable: false, reason: 'lightning' })).toBeNull()
+  })
+})
+
+describe('tierWinRate — the eval fails only when the first tier collapses', () => {
+  const won = (backend: string, tier_errors: TierError[] = [], tier_rejections: TierRejection[] = []) =>
+    ({ backend, tier_errors, tier_rejections })
+  const primaryWins = (n: number) => Array.from({ length: n }, () => won('anthropic-primary'))
+  const schemaFailure = won('openai-secondary', [{ backend: 'anthropic-primary', status: null, message: 'No output generated.' }])
+  const rejected = won('openai-secondary', [], [{ backend: 'anthropic-primary', issues: [{ code: 'stock_phrase', detail: '' }, { code: 'size_in_feet', detail: '' }] }])
+
+  // ~8% is the historical base rate; 4/10 is the worst run on record.
+  it('passes at 4 losses in 10', () => {
+    const r = tierWinRate([...primaryWins(6), schemaFailure, schemaFailure, rejected, rejected], 'anthropic-primary')
+    expect(r.failed).toBe(false)
+    expect(r.wins.get('anthropic-primary')).toBe(6)
+    expect(r.wins.get('openai-secondary')).toBe(4)
+  })
+
+  it('fails at half', () => {
+    expect(tierWinRate([...primaryWins(5), ...Array(5).fill(schemaFailure)], 'anthropic-primary').failed).toBe(true)
+  })
+
+  // A schema failure carries no HTTP status, so isConfigurationError never sees it — this is
+  // the only place it shows up.
+  it('says why the first tier lost each report', () => {
+    const r = tierWinRate([schemaFailure, rejected, won('bun-fallback', [{ backend: 'anthropic-primary', status: 529, message: 'Overloaded' }])], 'anthropic-primary')
+    expect(r.lossReasons).toEqual([
+      'error: No output generated.',
+      'rejected: stock_phrase, size_in_feet',
+      'HTTP 529: Overloaded',
+    ])
+  })
+
+  it('does not fail an empty run', () => {
+    expect(tierWinRate([], 'anthropic-primary').failed).toBe(false)
   })
 })

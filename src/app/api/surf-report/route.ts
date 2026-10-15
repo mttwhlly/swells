@@ -3,6 +3,7 @@ import { getCachedReport, saveReport, ensureInitialized } from '@/lib/db';
 import { getLocation, DEFAULT_LOCATION_SLUG, pickEarnedSpotFeatures, type Location, type ShinesWhenData } from '@/lib/locations';
 import type { SurfReport } from '@/types/surf-report';
 import { describeWaveSize } from '@/lib/waveSize';
+import { getSessionViability, type SessionViability } from '@/lib/sessionViability';
 
 export const dynamic = 'force-dynamic';
 
@@ -225,7 +226,8 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
       console.error('⚠️ Bun AI service failed, using local fallback:', bunError);
 
       const windMph = Math.round(surfData.details.wind_speed_kts * 1.15078);
-      const fallbackReport = createDetailedFallbackReport(surfData, windMph, location);
+      const viability = getSessionViability(new Date(), location.lat, location.lon, location.timezone, surfData.weather.weather_description);
+      const fallbackReport = createDetailedFallbackReport(surfData, windMph, location, viability);
 
       report = {
         id: `surf_fallback_${location.slug}_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
@@ -248,7 +250,7 @@ async function generateFreshReportViaBun(request: NextRequest, startTime: number
           wetsuit_thickness: surfData.weather.water_temperature_f < 65 ? '3/2mm' : surfData.weather.water_temperature_f < 72 ? 'Spring suit' : undefined,
           skill_level: surfData.score >= 65 ? 'intermediate' : 'beginner',
           best_spots: pickEarnedSpotFeatures(location.spotFeatures, shinesWhenDataFrom(surfData)).map(f => pickExample(f.examples)),
-          timing_advice: 'Check conditions regularly as they change throughout the day'
+          timing_advice: fallbackTimingAdvice(surfData.details.tide_state, viability)
         },
         cached_until: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
         generation_meta: {
@@ -315,12 +317,46 @@ function shinesWhenDataFrom(surfData: SurfabilityData): ShinesWhenData {
   };
 }
 
-function createDetailedFallbackReport(surfData: SurfabilityData, windMph: number, location: Location): string {
-  const condition = surfData.score >= 70 ? 'good' : surfData.score >= 50 ? 'fair' : 'poor';
+// Mirrors getFallbackTimingAdvice in bun-service/index.ts.
+function fallbackTimingAdvice(tideState: string, viability: SessionViability): string {
+  if (!viability.viable) {
+    if (viability.reason === 'lightning') return 'Wait for the storm to clear completely before considering paddling out';
+    if (viability.isPreDawn) return `Check back once it's light (~${viability.riseStr}) for an accurate read on conditions`;
+    return viability.sunriseIsLaterToday
+      ? `Check back later this morning (~${viability.riseStr}) for an accurate read on conditions`
+      : `Check back tomorrow morning (~${viability.riseStr}) for an accurate read on conditions`;
+  }
+  if (tideState.includes('Rising')) return 'Session now — rising tide tends to clean up the waves';
+  if (tideState.includes('Falling')) return 'Go sooner rather than later — falling tide can get shallow over the sandbars';
+  if (tideState.includes('Low')) return 'Wait for the tide to come up a bit for better shape';
+  return 'Mid to outgoing tide usually favours the local breaks — check tide charts for timing';
+}
+
+// The second deterministic template — bun-service's createEnhancedFallbackReport is the
+// first. Their night and lightning branches are word-for-word the same; keep them that way.
+function createDetailedFallbackReport(surfData: SurfabilityData, windMph: number, location: Location, viability: SessionViability): string {
   // Speak in body scale, not in feet: the underlying number is offshore significant wave
   // height, which reads as face height to a surfer and is meaningfully smaller than one.
   const size = waveSizeFor(surfData);
-  const swellCompass = surfData.details.swell_direction_compass || 'unknown direction';
+
+  if (!viability.viable) {
+    if (viability.reason === 'lightning') {
+      const p1 = `Lightning and thunderstorm activity means the ocean is unsafe right now — stay out of the water. No surf session is worth the risk during an electrical storm.`;
+      const p2 = `Keep an eye on the radar and check back once the storm fully clears. The ${size.size_descriptor} swell at ${surfData.details.wave_period_sec}s should still be around once it's safe to paddle out.`;
+      return `${p1}\n\n${p2}`;
+    }
+    const checkBackPhrase = viability.sunriseIsLaterToday
+      ? `later this morning (~${viability.riseStr})`
+      : `tomorrow morning (~${viability.riseStr})`;
+    const p1 = `Too dark to surf at ${location.name} right now — sunrise is ${checkBackPhrase}. Current snapshot: ${size.size_descriptor} waves at ${surfData.details.wave_period_sec}s from the ${surfData.details.swell_direction_compass || 'east'} with ${windMph} mph ${surfData.details.wind_direction_compass || 'variable'} winds.`;
+    const p2 = `Check back ${checkBackPhrase} for an accurate read — this snapshot won't necessarily hold once it's light.`;
+    return `${p1}\n\n${p2}`;
+  }
+
+  const condition = surfData.score >= 70 ? 'good' : surfData.score >= 50 ? 'fair' : 'poor';
+  // Drop the clause when the compass is missing rather than printing "unknown direction".
+  const swellCompass = surfData.details.swell_direction_compass;
+  const swellClause = swellCompass ? ` from the ${swellCompass}` : '';
   const windCompass = surfData.details.wind_direction_compass || 'variable';
 
   // Only name a spot when today's real data actually earns it (matches its
@@ -330,7 +366,7 @@ function createDetailedFallbackReport(surfData: SurfabilityData, windMph: number
   const primarySpot = earned[0] ? pickExample(earned[0].examples) : undefined;
   const secondarySpot = earned[1] ? pickExample(earned[1].examples) : undefined;
 
-  const paragraph1 = `${location.name} surf check shows ${size.size_descriptor} waves at ${surfData.details.wave_period_sec} seconds from ${swellCompass} direction, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some long rides' : 'quicker, choppier waves with less push'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} and water temp is ${surfData.weather.water_temperature_f}°F.`;
+  const paragraph1 = `${location.name} surf check shows ${size.size_descriptor} waves at ${surfData.details.wave_period_sec} seconds${swellClause}, delivering ${surfData.details.wave_period_sec >= 10 ? 'decent power with some long rides' : 'quicker, choppier waves with less push'}. Wind is ${windMph} mph from the ${windCompass} which ${windMph < 10 ? 'is light enough for clean conditions' : 'is creating some texture and bump on the water'}. Tide is ${surfData.details.tide_state.toLowerCase()} and water temp is ${surfData.weather.water_temperature_f}°F.`;
 
   const spotClause = !primarySpot
     ? `Today's setup doesn't clearly favor one spot over another here — worth checking a few stretches`
@@ -340,7 +376,13 @@ function createDetailedFallbackReport(surfData: SurfabilityData, windMph: number
         ? `${primarySpot} or ${secondarySpot} should find a way to produce rideable waves on a day like this`
         : `${primarySpot} should find a way to produce rideable waves on a day like this`;
 
-  const paragraph2 = `${spotClause}. ${surfData.weather.water_temperature_f < 65 ? 'You\'ll want a 3/2mm or thicker wetsuit for that cold water' : surfData.weather.water_temperature_f < 72 ? 'A spring suit should be fine' : 'Boardshorts or spring suit territory — comfortable water temps'}. ${condition === 'good' ? 'Definitely worth the paddle out today!' : condition === 'fair' ? 'Surfable if you need your wave fix.' : 'Might be better for a beach walk, but conditions can change quickly.'}`;
+  // Same verdicts as the Bun template, which avoid GATED_STOCK_PHRASES — this one used to
+  // ship "worth the paddle out", a phrase the model tiers are rejected for.
+  const verdict = condition === 'good' ? 'Definitely a day to get out there!'
+    : condition === 'fair' ? 'Surfable if you need your wave fix.'
+    : 'Might be better for a beach walk, but conditions can change quickly.';
+
+  const paragraph2 = `${spotClause}. ${surfData.weather.water_temperature_f < 65 ? 'You\'ll want a 3/2mm or thicker wetsuit for that cold water' : surfData.weather.water_temperature_f < 72 ? 'A spring suit should be fine' : 'Boardshorts or spring suit territory — comfortable water temps'}. ${verdict}`;
 
   return `${paragraph1}\n\n${paragraph2}`;
 }

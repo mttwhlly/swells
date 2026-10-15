@@ -28,8 +28,8 @@ bun dev           # Hot-reload dev server
 
 Baseline suite covering the golden paths: home page, a `[slug]` location page, `/api/surf-report` (cache-hit and cache-miss), `/api/og`.
 
-- **Vitest** (`tests/unit/`) tests route-handler logic in isolation — `@/lib/db` and `fetch` are mocked, so no real DB/network calls happen. Also covers the coast-orientation scoring and the Hs→body-scale conversion.
-- **`bun test`** (from `bun-service/`) covers `waveSizeOf`. Offline — it calls no models, unlike `bun run eval`.
+- **Vitest** (`tests/unit/`) tests route-handler logic in isolation — `@/lib/db` and `fetch` are mocked, so no real DB/network calls happen. Also covers the coast-orientation scoring, the Hs→body-scale conversion, session viability (day/night/lightning), and the local fallback template at 5am, 10:30pm, in daylight and in a thunderstorm.
+- **`bun test`** (from `bun-service/`) covers `waveSizeOf`, `getSessionViability`, the report-validation gates and the eval's win-rate gate. Offline — it calls no models, unlike `bun run eval`.
 - **Playwright** (`tests/e2e/`) drives a real `pnpm dev` server in a browser. The `/api/surf-report` client fetch is intercepted with `page.route` to avoid exercising the live generation chain (surfability → Bun AI service → DB write); server-side reads of the DB cache (in `[slug]/page.tsx`) are real, so `.env.local` must be present locally. Not wired into CI yet.
 - `/api/og`'s e2e test is `test.fixme()` — the route currently crashes on every request in dev (tracked in [#36](https://github.com/mttwhlly/swells/issues/36)), pre-existing and unrelated to any of this repo's other in-flight work.
 
@@ -66,7 +66,7 @@ Browser → /api/surf-report (GET)
 
 Report generation is **not done inside Next.js** — but its source *is* in this repo, at [`bun-service/`](bun-service/CLAUDE.md). Only the *deployment* is separate: it ships as its own Docker image on Coolify (base directory `/bun-service`), and `BUN_SERVICE_URL` points the Next.js app at it over HTTP. Edit the prompt, the model ladder, or the generation fallbacks in `bun-service/index.ts`, not in `src/`.
 
-The service runs a model ladder — Claude Haiku 5.5 (`@ai-sdk/anthropic`) primary, `gpt-6-luna` (`@ai-sdk/openai`) secondary if the primary errors or fails `validateReportText`, then a deterministic non-AI template. The Next.js `surf-report` route only calls the service; if it's unreachable entirely, Next.js falls back to its own local text template (`createDetailedFallbackReport`). Note there are therefore **two** deterministic templates — one in each process — and they need to stay in step.
+The service runs a model ladder — Claude Haiku 5.5 (`@ai-sdk/anthropic`) primary, `gpt-6-luna` (`@ai-sdk/openai`) secondary if the primary errors or fails `validateReportText`, then a deterministic non-AI template. The Next.js `surf-report` route only calls the service; if it's unreachable entirely, Next.js falls back to its own local text template (`createDetailedFallbackReport`). Note there are therefore **two** deterministic templates — one in each process — and they need to stay in step. Their night, pre-dawn and lightning branches are word-for-word identical, and both decide which applies with the same `getSessionViability`: the Next.js copy lives in `src/app/lib/sessionViability.ts`, held to the Bun one by an identical golden table in `tests/unit/session-viability.test.ts` and `bun-service/session-viability.test.ts` (the same arrangement as `waveSize`).
 
 ### External data sources (all in `/api/surfability/route.ts`)
 

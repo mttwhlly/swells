@@ -143,6 +143,61 @@ describe('GET /api/surf-report', () => {
     expect(mockSaveReport).toHaveBeenCalledTimes(1);
   });
 
+  // The Bun service carries its own deterministic template with night and lightning
+  // handling; this one, used when that service is unreachable, had neither — at 2am it
+  // described a surf session. The clock is pinned because the branch depends on it.
+  describe('local fallback template, by time of day', () => {
+    async function fallbackAt(iso: string, weather = 'Clear') {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date(iso));
+      delete process.env.BUN_SERVICE_URL;
+      mockGetCachedReport.mockResolvedValueOnce(null);
+      fetchMock.mockResolvedValueOnce(jsonResponse({
+        ...surfabilityFixture,
+        weather: { ...surfabilityFixture.weather, weather_description: weather },
+      }));
+      const res = await GET(new NextRequest('http://localhost:3000/api/surf-report?location=st-augustine'));
+      return (await res.json()) as SurfReport;
+    }
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    // The 5:07 AM cron run that shipped "no surfing tonight ... check back tomorrow".
+    it('at 5am, says it is too dark and points to sunrise later this morning', async () => {
+      const body = await fallbackAt('2026-10-15T09:07:00Z');
+
+      expect(body.report).toMatch(/Too dark to surf at St\. Augustine/);
+      expect(body.report).toMatch(/later this morning \(~\d{1,2}:\d{2} AM\)/);
+      expect(body.report).not.toMatch(/\b(tonight|tomorrow)\b/i);
+      expect(body.report).not.toMatch(/head to|should find a way to produce rideable waves|get out there/);
+      expect(body.recommendations.timing_advice).toMatch(/^Check back later this morning/);
+    });
+
+    it('before midnight, points to sunrise tomorrow morning', async () => {
+      const body = await fallbackAt('2026-10-15T02:30:00Z'); // 10:30pm EDT, Oct 14
+
+      expect(body.report).toMatch(/tomorrow morning \(~\d{1,2}:\d{2} AM\)/);
+      expect(body.recommendations.timing_advice).toMatch(/^Check back tomorrow morning/);
+    });
+
+    it('during a thunderstorm, says to stay out of the water even in daylight', async () => {
+      const body = await fallbackAt('2026-10-15T18:00:00Z', 'Thunderstorm');
+
+      expect(body.report).toMatch(/ocean is unsafe right now/);
+      expect(body.recommendations.timing_advice).toMatch(/storm to clear/);
+    });
+
+    it('in daylight, describes the session without phrases the model tiers are rejected for', async () => {
+      const body = await fallbackAt('2026-10-15T18:00:00Z'); // 2pm EDT
+
+      expect(body.report).toMatch(/St\. Augustine, FL surf check shows/);
+      expect(body.report).not.toMatch(/worth the paddle out|unknown direction/i);
+      expect(body.recommendations.timing_advice).toMatch(/rising tide/);
+    });
+  });
+
   it('rejects an unknown location slug', async () => {
     const req = new NextRequest('http://localhost:3000/api/surf-report?location=nowhereville');
     const res = await GET(req);
